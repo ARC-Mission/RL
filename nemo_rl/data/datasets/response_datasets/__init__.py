@@ -14,6 +14,8 @@
 
 from nemo_rl.data import ResponseDatasetConfig
 from nemo_rl.data.datasets.response_datasets.aime24 import AIME2024Dataset
+from nemo_rl.data.datasets.response_datasets.aime25 import AIME2025Dataset
+from nemo_rl.data.datasets.response_datasets.aime26 import AIME2026Dataset
 from nemo_rl.data.datasets.response_datasets.clevr import CLEVRCoGenTDataset
 from nemo_rl.data.datasets.response_datasets.daily_omni import DailyOmniDataset
 from nemo_rl.data.datasets.response_datasets.dapo_math import (
@@ -21,12 +23,22 @@ from nemo_rl.data.datasets.response_datasets.dapo_math import (
     DAPOMathAIME2024Dataset,
 )
 from nemo_rl.data.datasets.response_datasets.deepscaler import DeepScalerDataset
+from nemo_rl.data.datasets.response_datasets.dapo_math_qwen3 import (
+    DapoMathQwen3Dataset,
+)
+from nemo_rl.data.datasets.response_datasets.deepmath_qwen3 import (
+    DeepMathQwen3Dataset,
+)
+from nemo_rl.data.datasets.response_datasets.openthoughts_math import (
+    OpenThoughtsMathDataset,
+)
 from nemo_rl.data.datasets.response_datasets.general_conversations_dataset import (
     GeneralConversationsJsonlDataset,
 )
 from nemo_rl.data.datasets.response_datasets.geometry3k import Geometry3KDataset
 from nemo_rl.data.datasets.response_datasets.gsm8k import GSM8KDataset
 from nemo_rl.data.datasets.response_datasets.helpsteer3 import HelpSteer3Dataset
+from nemo_rl.data.datasets.response_datasets.math500 import Math500Dataset
 from nemo_rl.data.datasets.response_datasets.nemogym_dataset import NemoGymDataset
 from nemo_rl.data.datasets.response_datasets.oai_format_dataset import (
     OpenAIFormatDataset,
@@ -43,12 +55,17 @@ from nemo_rl.data.datasets.response_datasets.tulu3 import Tulu3SftMixtureDataset
 DATASET_REGISTRY = {
     # built-in datasets
     "AIME2024": AIME2024Dataset,
+    "AIME2025": AIME2025Dataset,
+    "AIME2026": AIME2026Dataset,
     "clevr-cogent": CLEVRCoGenTDataset,
     "daily-omni": DailyOmniDataset,
     "general-conversation-jsonl": GeneralConversationsJsonlDataset,
     "DAPOMath17K": DAPOMath17KDataset,
     "DAPOMathAIME2024": DAPOMathAIME2024Dataset,
     "DeepScaler": DeepScalerDataset,
+    "DapoMathQwen3": DapoMathQwen3Dataset,
+    "DeepMathQwen3": DeepMathQwen3Dataset,
+    "OpenThoughtsMath": OpenThoughtsMathDataset,
     "geometry3k": Geometry3KDataset,
     "HelpSteer3": HelpSteer3Dataset,
     "open_assistant": OasstDataset,
@@ -57,6 +74,7 @@ DATASET_REGISTRY = {
     "squad": SquadDataset,
     "tulu3_sft_mixture": Tulu3SftMixtureDataset,
     "gsm8k": GSM8KDataset,
+    "math500": Math500Dataset,
     # load from local JSONL file or HuggingFace
     "openai_format": OpenAIFormatDataset,
     "NemoGymDataset": NemoGymDataset,
@@ -91,6 +109,8 @@ def load_response_dataset(data_config: ResponseDatasetConfig):
 
 __all__ = [
     "AIME2024Dataset",
+    "AIME2025Dataset",
+    "AIME2026Dataset",
     "CLEVRCoGenTDataset",
     "DailyOmniDataset",
     "GeneralConversationsJsonlDataset",
@@ -98,8 +118,12 @@ __all__ = [
     "DAPOMathAIME2024Dataset",
     "GSM8KDataset",
     "DeepScalerDataset",
+    "DapoMathQwen3Dataset",
+    "DeepMathQwen3Dataset",
+    "OpenThoughtsMathDataset",
     "Geometry3KDataset",
     "HelpSteer3Dataset",
+    "Math500Dataset",
     "NemoGymDataset",
     "OasstDataset",
     "OpenAIFormatDataset",

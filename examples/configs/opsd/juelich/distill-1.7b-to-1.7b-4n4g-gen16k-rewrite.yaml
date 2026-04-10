@@ -1,22 +1,31 @@
-# Distillation with teacher-specific conciseness prompt
-# The teacher sees a different prompt than the student, biasing its logprob
-# distribution toward concise reasoning. The KL loss then pushes the student
-# to produce responses the teacher considers likely under "be concise" context.
+# Distillation: Qwen3-1.7B → Qwen3-1.7B (self-distill, rewrite teacher)
+# Cluster: Jülich — 4 nodes × 4 A100 GPUs
+# DP = total_gpus / (TP × CP) = 16 / (4 × 2) = 2
+# Generation: 16k tokens, teacher sequence: ~33k (16k static trace + 800 instr + 16k student ans)
+# topk=512, reverse KL, bs=64
+#
+# Teacher prompt: examples/prompts/teacher_rewrite.txt
+#   {problem}  ← from dataset messages[0]
+#   {trace}    ← mapped from column `qwen3_1b7_answer` via data.default.column_mapping
+# Training dataset: yllkryeziu/openthoughts114k-math-qwen3
+#   Must have a `messages` column so ResponseDataset preserves extra columns.
+
 distillation:
     num_prompts_per_step: 128
     num_generations_per_prompt: 1
     max_rollout_turns: 1
     max_num_steps: 1000
-    max_num_epochs: 10
+    max_num_epochs: 1
     val_batch_size: 64
     val_period: 25
-    val_at_start: true
+    val_steps: []
+    val_at_start: false
     val_at_end: false
     max_val_samples: 512
-    topk_logits_k: 64
+    topk_logits_k: 512
     teacher_student_prefix_fraction: 0.0
-    # teacher_student_prefix_fraction_start: 0.95  # linearly interpolate from _start to teacher_student_prefix_fraction
-    # teacher_student_prefix_fraction_warmup_steps: 200  # over this many steps
+    val_max_total_sequence_length: 33280
+    val_max_new_tokens: 32768
     seed: 42
 
 loss_fn:
@@ -26,7 +35,7 @@ loss_fn:
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-concise-${policy.model_name}"
+    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-rewrite"
     metric_name: "val:accuracy"
     higher_is_better: true
     keep_top_k: 3
@@ -44,26 +53,26 @@ policy: &POLICY_BASE
     train_micro_batch_size: 1
     generation_batch_size: 64
     logprob_batch_size: 1
-    max_total_sequence_length: 8192
+    max_total_sequence_length: 17408  # 800 prompt + 16384 generation, div by TP×CP×2=16
     precision: "bfloat16"
     logprob_chunk_size: null
 
-    offload_optimizer_for_logprob: false
+    offload_optimizer_for_logprob: true
 
     dtensor_cfg: &DTENSOR_BASE
         enabled: true
         _v2: true
-        cpu_offload: False
+        cpu_offload: true
         sequence_parallel: false
         activation_checkpointing: true
-        tensor_parallel_size: 2
+        tensor_parallel_size: 4
         context_parallel_size: 2
         custom_parallel_plan: null
 
     dynamic_batching:
         enabled: true
-        train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
-        logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
+        train_mb_tokens: 32768      # fits ~1 student sequence (17408 tokens)
+        logprob_mb_tokens: 32768
         sequence_length_round: 64
 
     sequence_packing:
@@ -78,7 +87,7 @@ policy: &POLICY_BASE
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
-            lr: 2.0e-5
+            lr: 5e-6
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
@@ -120,19 +129,14 @@ policy: &POLICY_BASE
             bf16: true
             fp16: false
             params_dtype: "float32"
-
             adam_beta1: 0.9
             adam_beta2: 0.999
             adam_eps: 1e-8
-
             sgd_momentum: 0.9
-
             use_distributed_optimizer: true
             use_precision_aware_optimizer: true
-
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
-
             clip_grad: ${policy.max_grad_norm}
 
         scheduler:
@@ -171,7 +175,7 @@ policy: &POLICY_BASE
 
     generation:
         backend: "vllm"
-        max_new_tokens: ${..max_total_sequence_length}
+        max_new_tokens: 16384  # student generates up to 16k tokens
         temperature: 1.0
         top_p: 1.0
         top_k: null
@@ -184,8 +188,8 @@ policy: &POLICY_BASE
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1
-            gpu_memory_utilization: 0.6
-            max_model_len: ${...max_total_sequence_length}
+            gpu_memory_utilization: 0.4
+            max_model_len: 33280  # kept for validation coverage (val generates up to 32768)
             enforce_eager: False
             use_deep_gemm: False
             num_last_layers_in_bf16: 0
@@ -198,40 +202,41 @@ policy: &POLICY_BASE
                 gpus_per_node: null
                 num_nodes: null
 
-
 teacher:
     <<: *POLICY_BASE
-    model_name: "Qwen/Qwen3-4B"
+    model_name: "Qwen/Qwen3-1.7B"
+    max_total_sequence_length: 33280  # 16k static trace + 800 instr + 16384 student ans, div by TP×CP×2=16
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 1
+        context_parallel_size: 2  # increased from 1 — needed for 33k-token sequences
         tensor_parallel_size: 4
+    dynamic_batching:
+        enabled: true
+        logprob_mb_tokens: 65536  # fits ~2 teacher sequences (33280 tokens each)
+        sequence_length_round: 64
 
 data:
     max_input_seq_length: ${policy.max_total_sequence_length}
     shuffle: true
-
-    # dataset
     train:
-        dataset_name: DeepScaler
+        dataset_name: OpenThoughtsMath
     validation:
         dataset_name: AIME2024
         repeat: 4
-    # default settings for all datasets
+        teacher_prompt_file: null  # AIME2024 has no trace column — block default from propagating
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        # Teacher sees this prompt instead of cot.txt when scoring student responses.
-        # Uses named placeholders: {problem}, {answer} (from dataset columns).
-        teacher_prompt_file: "examples/prompts/teacher_concise_math.txt"
+        teacher_prompt_file: "examples/prompts/teacher_rewrite.txt"
         env_name: "math"
+        column_mapping: {}  # set per-run via +data.default.column_mapping.COLUMN=trace
 
 env:
     math:
         num_workers: 8
 
 logger:
-    log_dir: "logs/distillation"
+    log_dir: "logs/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-rewrite"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -243,11 +248,11 @@ logger:
         flush_interval: 10
     wandb:
         project: "nemo-distillation"
-        name: "/p/scratch/scifi/kryeziu1/opsd/logs/distillation-concise-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-rewrite-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
     swanlab:
         project: "nemo-distillation"
-        name: "distillation-concise-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        name: "distillation-rewrite-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
 
 cluster:
     gpus_per_node: 4
-    num_nodes: 1
+    num_nodes: 4

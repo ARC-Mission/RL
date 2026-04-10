@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and limitations.
 # limitations under the License.
+import gc
 import os
 import warnings
 from copy import deepcopy
@@ -80,6 +81,7 @@ class DistillationConfig(TypedDict):
     max_num_epochs: int  # maximum number of epochs to train for
     val_batch_size: int
     val_period: int
+    val_steps: NotRequired[list[int]]  # explicit steps to validate at (in addition to val_period)
     val_at_start: bool
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
@@ -87,9 +89,16 @@ class DistillationConfig(TypedDict):
     max_val_samples: int
     topk_logits_k: int
     seed: int
+    teacher_student_prefix_fraction: NotRequired[float]
+    teacher_student_prefix_fraction_start: NotRequired[float]
+    teacher_student_prefix_fraction_warmup_steps: NotRequired[int]
     # Optional overrides for validation rollouts (see validate()).
     val_max_total_sequence_length: NotRequired[Optional[int]]
     val_max_new_tokens: NotRequired[Optional[int]]
+    val_temperature: NotRequired[Optional[float]]
+    # If set, copy student weights to the teacher every N steps (online self-distillation).
+    # None (default) keeps the teacher frozen for the entire run.
+    teacher_update_period: NotRequired[Optional[int]]
 
 
 class DistillationSaveState(TypedDict):
@@ -219,6 +228,26 @@ def setup(
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
             )
 
+    # Validate teacher_student_prefix_fraction warmup config
+    frac_start = distillation_config.get("teacher_student_prefix_fraction_start")
+    warmup_steps = distillation_config.get("teacher_student_prefix_fraction_warmup_steps")
+    has_start = frac_start is not None
+    has_warmup = warmup_steps is not None
+    if has_start != has_warmup:
+        raise ValueError(
+            "teacher_student_prefix_fraction_start and "
+            "teacher_student_prefix_fraction_warmup_steps must both be set or both be absent."
+        )
+    if has_start:
+        if not 0.0 <= frac_start <= 1.0:
+            raise ValueError(
+                f"teacher_student_prefix_fraction_start must be in [0, 1], got {frac_start}"
+            )
+        if warmup_steps <= 0:
+            raise ValueError(
+                f"teacher_student_prefix_fraction_warmup_steps must be > 0, got {warmup_steps}"
+            )
+
     # Set random seed
     set_seed(distillation_config["seed"])
 
@@ -266,6 +295,7 @@ def setup(
     # If validation is enabled, load the validation dataloader
     if (
         distillation_config["val_period"] > 0
+        or distillation_config.get("val_steps", [])
         or distillation_config["val_at_start"]
         or distillation_config["val_at_end"]
     ):
@@ -461,6 +491,15 @@ def setup(
         init_reference_model=False,
     )
 
+    # When resuming with online teacher updates, sync student weights to teacher
+    # so the teacher matches the state it would have had before the interruption.
+    if last_checkpoint_path and distillation_config.get("teacher_update_period"):
+        print("▶ Syncing student weights to teacher (resume with teacher updates)...", flush=True)
+        student_weights_path = str(Path(last_checkpoint_path) / "policy" / "weights")
+        teacher_policy.prepare_for_lp_inference()
+        teacher_policy.load_checkpoint(weights_path=student_weights_path)
+        teacher_policy.offload_after_refit()
+
     if student_generation is not None:
         state_dict_info = student_policy.prepare_refit_info()
         student_generation.prepare_refit_info(state_dict_info)
@@ -548,6 +587,147 @@ def _align_teacher_topk_to_student(
     return aligned_logits, aligned_indices
 
 
+def _get_scheduled_teacher_student_prefix_fraction(
+    fraction_end: float,
+    fraction_start: float | None,
+    warmup_steps: int | None,
+    total_steps: int,
+) -> float:
+    """Compute the effective prefix fraction for the current step.
+
+    Linearly interpolates from *fraction_start* to *fraction_end* over
+    *warmup_steps* training steps.  If warmup is not configured (either
+    value is ``None``), returns *fraction_end* unchanged (backwards
+    compatible).
+    """
+    if fraction_start is None or warmup_steps is None:
+        return fraction_end
+    if total_steps >= warmup_steps:
+        return fraction_end
+    progress = total_steps / warmup_steps
+    return fraction_start + (fraction_end - fraction_start) * progress
+
+
+def _get_teacher_student_prefix_indices(
+    batch_size: int,
+    fraction: float,
+    seed: int,
+    total_steps: int,
+) -> torch.Tensor:
+    """Select a deterministic per-step subset that reuses the student prefix."""
+    if not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            f"distillation.teacher_student_prefix_fraction must be in [0, 1], got {fraction}"
+        )
+    if batch_size <= 0 or fraction <= 0.0:
+        return torch.empty(0, dtype=torch.long)
+
+    selected_count = min(batch_size, int(np.floor(batch_size * fraction + 0.5)))
+    if selected_count <= 0:
+        return torch.empty(0, dtype=torch.long)
+    if selected_count >= batch_size:
+        return torch.arange(batch_size, dtype=torch.long)
+
+    step_seed = (seed * 1_000_003) + total_steps
+    rng = np.random.default_rng(step_seed)
+    selected = np.sort(rng.choice(batch_size, size=selected_count, replace=False))
+    return torch.tensor(selected, dtype=torch.long)
+
+
+def _apply_teacher_student_prefix_mix(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    fraction: float,
+    seed: int,
+    total_steps: int,
+) -> dict[str, float]:
+    """Swap a deterministic subset of teacher prompts to the prefix prompt.
+
+    For selected samples the teacher_message_log is replaced with either:
+      - teacher_prefix_message_log (if present in batch), or
+      - the student's message_log (legacy fallback).
+    Non-selected samples keep their original teacher_message_log.
+    """
+    metrics = {
+        "teacher_student_prefix_fraction_scheduled": float(fraction),
+        "teacher_student_prefix_selected_count": 0.0,
+        "teacher_student_prefix_realized_fraction": 0.0,
+        "teacher_prompt_count": 0.0,
+        "teacher_student_prefix_mean_teacher_input_length": 0.0,
+        "teacher_prompt_mean_teacher_input_length": 0.0,
+    }
+
+    selected_indices = _get_teacher_student_prefix_indices(
+        batch_size=repeated_batch.size,
+        fraction=fraction,
+        seed=seed,
+        total_steps=total_steps,
+    )
+    if "teacher_message_log" not in repeated_batch or repeated_batch.size == 0:
+        return metrics
+
+    has_prefix_prompt = "teacher_prefix_message_log" in repeated_batch
+    selected_index_set = {int(idx) for idx in selected_indices.tolist()}
+    selected_prefix_lengths: list[int] = []
+    teacher_prompt_lengths: list[int] = []
+
+    for i in range(repeated_batch.size):
+        if i in selected_index_set:
+            if has_prefix_prompt:
+                repeated_batch["teacher_message_log"][i] = repeated_batch["teacher_prefix_message_log"][i]
+            else:
+                repeated_batch["teacher_message_log"][i] = repeated_batch["message_log"][i]
+            selected_prefix_lengths.append(
+                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+            )
+        else:
+            teacher_prompt_lengths.append(
+                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+            )
+
+    selected_count = float(len(selected_index_set))
+    teacher_prompt_count = float(repeated_batch.size - len(selected_index_set))
+    metrics.update(
+        {
+            "teacher_student_prefix_selected_count": selected_count,
+            "teacher_student_prefix_realized_fraction": (
+                selected_count / repeated_batch.size if repeated_batch.size > 0 else 0.0
+            ),
+            "teacher_prompt_count": teacher_prompt_count,
+            "teacher_student_prefix_mean_teacher_input_length": (
+                float(np.mean(selected_prefix_lengths))
+                if selected_prefix_lengths
+                else 0.0
+            ),
+            "teacher_prompt_mean_teacher_input_length": (
+                float(np.mean(teacher_prompt_lengths)) if teacher_prompt_lengths else 0.0
+            ),
+        }
+    )
+    return metrics
+
+
+def _inject_student_rollout_into_teacher_message_logs(
+    repeated_batch: BatchedDataDict[DatumSpec],
+) -> None:
+    """Populate teacher logs with student rollout turns without double-injecting."""
+    for i, student_ml in enumerate(repeated_batch["message_log"]):
+        teacher_ml = repeated_batch["teacher_message_log"][i]
+        teacher_already_has_rollout = teacher_ml is student_ml
+        if teacher_already_has_rollout:
+            teacher_ml = deepcopy(teacher_ml)
+            repeated_batch["teacher_message_log"][i] = teacher_ml
+        else:
+            for msg in student_ml:
+                if msg["role"] != "user":
+                    teacher_ml.append(deepcopy(msg))
+
+        for msg in teacher_ml:
+            if msg["role"] == "assistant":
+                msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
+            else:
+                msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+
+
 def _debug_print_first_sample(
     train_data: BatchedDataDict[Any],
     teacher_data: BatchedDataDict[Any],
@@ -585,37 +765,50 @@ def _debug_print_first_sample(
         f"[DISTILL_DEBUG] Teacher scored positions count: {len(scored_positions)}",
         flush=True,
     )
+
+    # Print the full scored token sequence (ids + text)
+    scored_ids = train_data["input_ids"][0][scored_positions].detach().cpu()
+    scored_texts = [
+        tokenizer.decode([int(t)], skip_special_tokens=False) for t in scored_ids
+    ]
     print(
-        f"[DISTILL_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        "[DISTILL_DEBUG] Scored token sequence (raw decode):",
+        flush=True,
+    )
+    print(
+        tokenizer.decode(scored_ids.tolist(), skip_special_tokens=False),
+        flush=True,
+    )
+    print(
+        f"[DISTILL_DEBUG] Scored token ids: {scored_ids.tolist()}",
+        flush=True,
+    )
+    print(
+        f"[DISTILL_DEBUG] Scored token texts: {scored_texts}",
         flush=True,
     )
 
-    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+    def _print_token_with_topk(rank: int, pos: int, label: str) -> None:
         token_id = int(train_data["input_ids"][0, pos].item())
         token_text = tokenizer.decode([token_id], skip_special_tokens=False)
-
         # teacher logits[i] predicts token[i+1], so the distribution used to
         # score the student token at *pos* comes from teacher logits at pos-1.
         teacher_pos = pos - 1
         if teacher_pos < 0:
             print(
-                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
+                f"[DISTILL_DEBUG] {label} pos={pos} "
                 f"student_token_id={token_id} student_token_text={token_text!r} "
                 f"(skipped: no teacher logit at pos-1)",
                 flush=True,
             )
-            continue
-
+            return
         logits_at_pos = teacher_topk_logits[teacher_pos]
         indices_at_pos = teacher_topk_indices[teacher_pos]
         top_vals, top_order = torch.topk(logits_at_pos, k=min(5, logits_at_pos.shape[0]))
-
         print(
-            (
-                f"[DISTILL_DEBUG] scored_token_{rank:02d} pos={pos} "
-                f"student_token_id={token_id} student_token_text={token_text!r} "
-                f"(teacher logits from pos={teacher_pos})"
-            ),
+            f"[DISTILL_DEBUG] {label} pos={pos} "
+            f"student_token_id={token_id} student_token_text={token_text!r} "
+            f"(teacher logits from pos={teacher_pos})",
             flush=True,
         )
         for j in range(top_vals.shape[0]):
@@ -624,12 +817,25 @@ def _debug_print_first_sample(
             cand_text = tokenizer.decode([cand_id], skip_special_tokens=False)
             cand_logit = float(top_vals[j].item())
             print(
-                (
-                    f"[DISTILL_DEBUG]   top{j + 1}: token_id={cand_id} "
-                    f"token_text={cand_text!r} logit={cand_logit:.6f}"
-                ),
+                f"[DISTILL_DEBUG]   top{j + 1}: token_id={cand_id} "
+                f"token_text={cand_text!r} logit={cand_logit:.6f}",
                 flush=True,
             )
+
+    print(
+        f"[DISTILL_DEBUG] First scored positions: {scored_positions[:preview_n].tolist()}",
+        flush=True,
+    )
+    for rank, pos in enumerate(scored_positions[:preview_n].tolist(), start=1):
+        _print_token_with_topk(rank, pos, f"scored_token_first_{rank:02d}")
+
+    print(
+        f"[DISTILL_DEBUG] Last scored positions: {scored_positions[-preview_n:].tolist()}",
+        flush=True,
+    )
+    last_positions = scored_positions[-preview_n:].tolist()
+    for rank, pos in enumerate(last_positions, start=len(scored_positions) - len(last_positions) + 1):
+        _print_token_with_topk(rank, pos, f"scored_token_last_{rank:02d}")
 
 
 def distillation_train(
@@ -674,6 +880,7 @@ def distillation_train(
     consumed_samples = distillation_save_state["consumed_samples"]
     total_valid_tokens = distillation_save_state["total_valid_tokens"]
     val_period = master_config["distillation"]["val_period"]
+    val_steps_set = set(master_config["distillation"].get("val_steps", []))
     val_at_start = master_config["distillation"]["val_at_start"]
     val_at_end = master_config["distillation"]["val_at_end"]
     colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
@@ -683,6 +890,9 @@ def distillation_train(
     max_steps = master_config["distillation"][
         "max_num_steps"
     ]  # max number of steps to train for
+    teacher_update_period: Optional[int] = master_config["distillation"].get(
+        "teacher_update_period", None
+    )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -701,6 +911,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -790,6 +1001,24 @@ def distillation_train(
 
                 with timer.time("data_processing"):
                     has_teacher_ml = "teacher_message_log" in repeated_batch
+                    scheduled_fraction = _get_scheduled_teacher_student_prefix_fraction(
+                        fraction_end=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction", 0.0
+                        ),
+                        fraction_start=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction_start", None
+                        ),
+                        warmup_steps=master_config["distillation"].get(
+                            "teacher_student_prefix_fraction_warmup_steps", None
+                        ),
+                        total_steps=total_steps,
+                    )
+                    teacher_context_metrics = _apply_teacher_student_prefix_mix(
+                        repeated_batch,
+                        fraction=scheduled_fraction,
+                        seed=master_config["distillation"]["seed"],
+                        total_steps=total_steps,
+                    )
 
                     # Add loss mask and advantages to each message in LLMMessageLogType
                     for message_log in repeated_batch["message_log"]:
@@ -805,18 +1034,7 @@ def distillation_train(
 
                     # Copy assistant messages to teacher_message_log and add loss masks
                     if has_teacher_ml:
-                        for i, student_ml in enumerate(repeated_batch["message_log"]):
-                            teacher_ml = repeated_batch["teacher_message_log"][i]
-                            # Copy non-user messages (assistant, environment) from student rollout
-                            for msg in student_ml:
-                                if msg["role"] != "user":
-                                    teacher_ml.append(deepcopy(msg))
-                            # Add loss masks to teacher message log
-                            for msg in teacher_ml:
-                                if msg["role"] == "assistant":
-                                    msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
-                                else:
-                                    msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+                        _inject_student_rollout_into_teacher_message_logs(repeated_batch)
 
                     # Convert updated LLMMessageLogType to FlatMessagesType for training
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
@@ -875,6 +1093,12 @@ def distillation_train(
                         timer=timer,
                     )
 
+                    # Downcast indices from int64 to int32 to halve CPU memory
+                    # (safe for any vocab_size < 2^31 ≈ 2.1B).
+                    teacher_topk["topk_indices"] = teacher_topk["topk_indices"].to(
+                        torch.int32
+                    )
+
                     if has_teacher_ml:
                         # Align teacher topk logits to student sequence positions
                         aligned_logits, aligned_indices = _align_teacher_topk_to_student(
@@ -892,6 +1116,22 @@ def distillation_train(
                     if total_steps == 0:
                         _debug_print_first_sample(train_data, teacher_data, tokenizer)
 
+                # Free large intermediate tensors before training to reduce
+                # peak CPU memory.  train_data already holds the (aligned)
+                # logits/indices it needs; everything else is dead weight.
+                del teacher_topk
+                if has_teacher_ml:
+                    del teacher_data
+                # Keep only the lightweight "content" field needed for logging;
+                # the heavy tensor fields (token_ids, token_loss_mask) are
+                # already referenced by train_data and stay alive through it.
+                flat_messages = {"content": flat_messages.get("content")}
+                # Keep lightweight fields (e.g. "length") used for metrics;
+                # drop the heavy message-log lists.
+                for _key in ("message_log", "teacher_message_log", "teacher_prefix_message_log"):
+                    repeated_batch.pop(_key, None)
+                gc.collect()
+
                 print("▶ Preparing for training...", flush=True)
                 with timer.time("training_prep"):
                     teacher_policy.offload_after_refit()
@@ -906,6 +1146,25 @@ def distillation_train(
                         timer=timer,
                     )
 
+                # Update teacher weights from student if configured
+                if (
+                    teacher_update_period
+                    and (total_steps + 1) % teacher_update_period == 0
+                ):
+                    print(
+                        f"▶ Updating teacher weights from student (step {total_steps + 1})...",
+                        flush=True,
+                    )
+                    with timer.time("teacher_weight_update"):
+                        sync_dir = os.path.join(
+                            master_config["checkpointing"]["checkpoint_dir"],
+                            "_teacher_sync",
+                        )
+                        student_policy.save_checkpoint(weights_path=sync_dir)
+                        teacher_policy.prepare_for_lp_inference()
+                        teacher_policy.load_checkpoint(weights_path=sync_dir)
+                        teacher_policy.offload_after_refit()
+
                 is_last_step = (total_steps + 1 >= max_steps) or (
                     (current_epoch + 1 == max_epochs)
                     and (current_step + 1 == len(dataloader))
@@ -913,8 +1172,8 @@ def distillation_train(
 
                 # Run validation if it's a validation step or last step with val_at_end
                 if (val_period > 0 and (total_steps + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                    (total_steps + 1) in val_steps_set
+                ) or (val_at_end and is_last_step):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
                             student_policy, student_generation, colocated_inference
@@ -929,6 +1188,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -956,6 +1216,12 @@ def distillation_train(
                         metrics[k] = np.mean(v).item()
                     else:
                         metrics[k] = np.sum(v).item()
+                metrics.update(teacher_context_metrics)
+                metrics["teacher_student_prefix_fraction_end"] = float(
+                    master_config["distillation"].get(
+                        "teacher_student_prefix_fraction", 0.0
+                    )
+                )
                 metrics.update(rollout_metrics)
                 total_valid_tokens += metrics["global_valid_toks"]
 
@@ -1138,6 +1404,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -1156,6 +1423,7 @@ def validate(
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
+        total_task_names = []  # Track which dataset each reward belongs to
         total_lengths = []
         all_message_logs = []  # Collect all message logs
 
@@ -1180,6 +1448,16 @@ def validate(
         )
         if swap_max_new_tokens:
             policy_generation.update_generation_params(max_new_tokens=val_max_new_tokens)
+
+        val_temperature = master_config["distillation"].get("val_temperature")
+        train_temperature = gen_cfg.get("temperature") if gen_cfg is not None else None
+        swap_temperature = (
+            val_temperature is not None
+            and train_temperature is not None
+            and val_temperature != train_temperature
+        )
+        if swap_temperature:
+            policy_generation.update_generation_params(temperature=val_temperature)
 
         try:
             for batch_idx, val_batch in enumerate(val_dataloader):
@@ -1215,7 +1493,13 @@ def validate(
                 rewards = val_batch["total_reward"]
 
                 total_rewards.extend(rewards.tolist())
-                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+                if "task_name" in val_batch:
+                    total_task_names.extend(val_batch["task_name"])
+                # Collect per-sample generation lengths for per-task breakdown
+                for ml in val_batch["message_log"]:
+                    total_lengths.append(
+                        sum(len(t["token_ids"]) for t in ml if t["role"] == "assistant")
+                    )
 
                 # Collect message logs for later display
                 to_env = [
@@ -1231,6 +1515,10 @@ def validate(
                 policy_generation.update_generation_params(
                     max_new_tokens=train_max_new_tokens
                 )
+            if swap_temperature:
+                policy_generation.update_generation_params(
+                    temperature=train_temperature
+                )
 
         # Calculate validation metrics
         accuracy = (
@@ -1244,6 +1532,28 @@ def validate(
             "accuracy": accuracy,
             "avg_length": avg_length,
         }
+
+        # Per-dataset breakdown (accuracy and avg_length)
+        if total_task_names:
+            from collections import defaultdict
+
+            per_task_rewards: dict[str, list[float]] = defaultdict(list)
+            per_task_lengths: dict[str, list[float]] = defaultdict(list)
+            for task_name, reward, length in zip(
+                total_task_names, total_rewards, total_lengths
+            ):
+                if task_name is not None:
+                    per_task_rewards[task_name].append(reward)
+                    per_task_lengths[task_name].append(length)
+            for task_name in sorted(per_task_rewards):
+                rewards_list = per_task_rewards[task_name]
+                lengths_list = per_task_lengths[task_name]
+                val_metrics[f"accuracy/{task_name}"] = (
+                    sum(rewards_list) / len(rewards_list)
+                )
+                val_metrics[f"avg_length/{task_name}"] = (
+                    sum(lengths_list) / len(lengths_list)
+                )
 
         # Print sample conversations only once at the end of validation
         try:
@@ -1260,6 +1570,14 @@ def validate(
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
 
+        # Save full validation rollouts for later inspection.
+        if logger is not None:
+            val_log_data = {
+                "content": all_message_logs,
+                "rewards": total_rewards,
+            }
+            logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
+
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")
     validation_time = timing_metrics.get("total_validation_time", 0)
@@ -1268,6 +1586,9 @@ def validate(
     print("\n📊 Validation Results:")
     print(f"    • Accuracy: {accuracy:.4f}")
     print(f"    • Average response length: {avg_length:.1f} tokens")
+    for key, value in sorted(val_metrics.items()):
+        if key.startswith("accuracy/") or key.startswith("avg_length/"):
+            print(f"    • {key}: {value:.4f}")
     print(f"    • Samples processed: {len(total_rewards)}", flush=True)
 
     # Print timing information

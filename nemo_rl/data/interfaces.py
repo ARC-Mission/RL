@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, NotRequired, Optional, Protocol, TypedDict, Union
 
 import torch
@@ -61,6 +61,15 @@ class TaskDataSpec:
     system_prompt_file: Optional[PathLike] = None
 
     teacher_prompt_file: Optional[PathLike] = None
+    teacher_prefix_prompt_file: Optional[PathLike] = None
+    column_mapping: dict = field(default_factory=dict)
+
+    # Trace conditioning mode: "full", "truncate", "mask", or "none"
+    trace_mode: str = "full"
+    # Fraction of trace to keep when trace_mode="truncate"
+    trace_truncate_fraction: float = 1.0
+    # Per-sentence mask probability when trace_mode="mask"
+    trace_mask_prob: float = 0.0
 
     def __post_init__(self) -> None:
         def load_prompt_file(
@@ -79,6 +88,7 @@ class TaskDataSpec:
         self.system_prompt = load_prompt_file(self.system_prompt_file)
         self.prompt = load_prompt_file(self.prompt_file)
         self.teacher_prompt = load_prompt_file(self.teacher_prompt_file)
+        self.teacher_prefix_prompt = load_prompt_file(self.teacher_prefix_prompt_file)
 
     def copy_defaults(self, from_spec: "TaskDataSpec") -> None:
         """Apply default values from another Task instance for any None attributes."""
@@ -86,6 +96,11 @@ class TaskDataSpec:
             "system_prompt": from_spec.system_prompt,
             "prompt": from_spec.prompt,
             "teacher_prompt": from_spec.teacher_prompt,
+            "teacher_prefix_prompt": from_spec.teacher_prefix_prompt,
+            "column_mapping": from_spec.column_mapping,
+            "trace_mode": from_spec.trace_mode,
+            "trace_truncate_fraction": from_spec.trace_truncate_fraction,
+            "trace_mask_prob": from_spec.trace_mask_prob,
         }
 
         for attr_name, default_value in default_attrs.items():

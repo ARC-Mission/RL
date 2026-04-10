@@ -31,6 +31,25 @@ class ResponseDatasetConfig(TypedDict):
     split_validation_size: NotRequired[float]
     # Seed for train/validation split when split_validation_size > 0
     seed: NotRequired[int]
+    # Trace conditioning mode for teacher prompt. Controls how the {trace}
+    # placeholder is processed before injection into the teacher prompt.
+    #   "full"     — use the entire trace unchanged (default)
+    #   "truncate" — keep only the first `trace_truncate_fraction` of the trace
+    #   "mask"     — randomly drop sentences with probability `trace_mask_prob`
+    #   "none"     — replace the trace with an empty string
+    trace_mode: NotRequired[Literal["full", "truncate", "mask", "none"]]
+    # Fraction of the trace to keep when trace_mode="truncate" (0.0 to 1.0)
+    trace_truncate_fraction: NotRequired[float]
+    # Probability of masking each sentence when trace_mode="mask" (0.0 to 1.0)
+    trace_mask_prob: NotRequired[float]
+    # Teacher prompt file (the default teacher prompt used for non-prefix samples)
+    teacher_prompt_file: NotRequired[str | None]
+    # Teacher prompt used for the prefix-fraction samples (see
+    # distillation.teacher_student_prefix_fraction).  When set, the selected
+    # fraction of teacher scoring uses this prompt instead of copying the
+    # student's message_log.  When absent, the legacy behaviour (copy the
+    # student message_log) is preserved.
+    teacher_prefix_prompt_file: NotRequired[str | None]
 
 
 class PreferenceDatasetConfig(TypedDict):

@@ -1,8 +1,8 @@
-# Distillation with teacher-specific conciseness prompt
-# The teacher sees a different prompt than the student, biasing its logprob
-# distribution toward concise reasoning. The KL loss then pushes the student
-# to produce responses the teacher considers likely under "be concise" context.
-distillation:
+# Sampled Token Distillation Configuration
+# On-policy distillation using reverse KL as per-token advantage in policy gradient.
+# Reference: https://thinkingmachines.ai/blog/on-policy-distillation/
+
+sampled_token_distillation:
     num_prompts_per_step: 128
     num_generations_per_prompt: 1
     max_rollout_turns: 1
@@ -13,20 +13,37 @@ distillation:
     val_at_start: true
     val_at_end: false
     max_val_samples: 512
-    topk_logits_k: 64
-    teacher_student_prefix_fraction: 0.0
-    # teacher_student_prefix_fraction_start: 0.95  # linearly interpolate from _start to teacher_student_prefix_fraction
-    # teacher_student_prefix_fraction_warmup_steps: 200  # over this many steps
     seed: 42
+    overlong_filtering: false
+    val_max_total_sequence_length: null
+    val_max_new_tokens: null
+    # KL advantage parameters
+    kl_penalty_coef: 1.0           # scales the KL-based advantages
+    kl_discount_factor: 0.0        # 0 = no discounting; >0 applies discounted future sum
 
+# Policy gradient loss — plain importance sampling (no PPO clipping)
+# Matches tinker-cookbook's loss_fn="importance_sampling"
 loss_fn:
-    kl_type: "reverse"
-    mixed_kl_weight: 0.5
-    zero_outside_topk: false
+    reference_policy_kl_penalty: 0.0    # 0 = no extra KL regularization beyond KL advantages
+    reference_policy_kl_type: "k3"
+    kl_input_clamp_value: null
+    kl_output_clamp_value: null
+    ratio_clip_min: 1e6               # effectively no clipping
+    ratio_clip_max: 1e6               # effectively no clipping
+    ratio_clip_c: null
+    use_on_policy_kl_approximation: false
+    use_importance_sampling_correction: false
+    truncated_importance_sampling_ratio: null
+    truncated_importance_sampling_ratio_min: null
+    truncated_importance_sampling_type: tis
+    sequence_level_importance_ratios: false
+    token_level_loss: true
+    force_on_policy_ratio: false
+    use_kl_in_reward: false
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-concise-${policy.model_name}"
+    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/std-${policy.model_name}-kl${sampled_token_distillation.kl_penalty_coef}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}"
     metric_name: "val:accuracy"
     higher_is_better: true
     keep_top_k: 3
@@ -120,19 +137,14 @@ policy: &POLICY_BASE
             bf16: true
             fp16: false
             params_dtype: "float32"
-
             adam_beta1: 0.9
             adam_beta2: 0.999
             adam_eps: 1e-8
-
             sgd_momentum: 0.9
-
             use_distributed_optimizer: true
             use_precision_aware_optimizer: true
-
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
-
             clip_grad: ${policy.max_grad_norm}
 
         scheduler:
@@ -211,19 +223,15 @@ data:
     max_input_seq_length: ${policy.max_total_sequence_length}
     shuffle: true
 
-    # dataset
     train:
         dataset_name: DeepScaler
     validation:
         dataset_name: AIME2024
         repeat: 4
-    # default settings for all datasets
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        # Teacher sees this prompt instead of cot.txt when scoring student responses.
-        # Uses named placeholders: {problem}, {answer} (from dataset columns).
-        teacher_prompt_file: "examples/prompts/teacher_concise_math.txt"
+        teacher_prompt_file: null
         env_name: "math"
 
 env:
@@ -231,7 +239,7 @@ env:
         num_workers: 8
 
 logger:
-    log_dir: "logs/distillation"
+    log_dir: "logs/std-${policy.model_name}-kl${sampled_token_distillation.kl_penalty_coef}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -242,11 +250,11 @@ logger:
         collection_interval: 10
         flush_interval: 10
     wandb:
-        project: "nemo-distillation"
-        name: "/p/scratch/scifi/kryeziu1/opsd/logs/distillation-concise-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        project: "nemo-sampled-token-distillation"
+        name: "/p/scratch/scifi/kryeziu1/opsd/logs/std-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-kl${sampled_token_distillation.kl_penalty_coef}"
     swanlab:
-        project: "nemo-distillation"
-        name: "distillation-concise-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        project: "nemo-sampled-token-distillation"
+        name: "std-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-kl${sampled_token_distillation.kl_penalty_coef}"
 
 cluster:
     gpus_per_node: 4
