@@ -63,4 +63,4 @@ echo "CUDA_HOME=$CUDA_HOME"
 nvidia-smi -L 2>/dev/null || echo "WARNING: nvidia-smi not found"
 echo "========================="
 
-uv run python examples/run_distillation.py
+NRL_FORCE_REBUILD_VENVS=true uv run python examples/run_distillation.py

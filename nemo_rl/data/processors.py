@@ -31,7 +31,10 @@ from nemo_rl.data.interfaces import (
     TaskDataSpec,
     VLMMessageLogType,
 )
-from nemo_rl.data.llm_message_utils import get_formatted_message_log
+from nemo_rl.data.llm_message_utils import (
+    get_first_index_that_differs,
+    get_formatted_message_log,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 
@@ -520,7 +523,11 @@ def math_hf_data_processor(
     # Build template fields shared by teacher prompts
     teacher_message_log = None
     teacher_prefix_message_log = None
-    if task_data_spec.teacher_prompt is not None or task_data_spec.teacher_prefix_prompt is not None:
+    if (
+        task_data_spec.teacher_prompt is not None
+        or task_data_spec.teacher_prefix_prompt is not None
+        or task_data_spec.teacher_refine_prompt is not None
+    ):
         format_kwargs = {"problem": problem, "answer": original_messages[1]["content"]}
         for key, value in datum_dict.items():
             if key not in ("messages", "task_name") and isinstance(value, str):
@@ -550,7 +557,78 @@ def math_hf_data_processor(
             msg["content"] = msg_str
             return [msg]
 
-        if task_data_spec.teacher_prompt is not None:
+        def _build_multiturn_teacher_ml(
+            student_prompt_content: str,
+            trace_text: str,
+            refine_prompt_text: str,
+        ) -> list[dict[str, Any]]:
+            """Build a multi-turn teacher message log.
+
+            Layout: [user(problem), assistant(<think>{trace}</think>), user(refine)].
+            The static dataset trace is *injected* as the assistant turn so the
+            teacher sees it as if the model reasoned itself. The live student
+            rollout is appended later by
+            ``_inject_student_rollout_into_teacher_message_logs`` and is the only
+            turn the teacher actually scores.
+
+            Uses incremental ``apply_chat_template`` (same approach as
+            ``get_formatted_message_log``) so per-message ``token_ids`` are the
+            chat-template chunk that turn contributes — concatenating them yields
+            the correct full conversation tokenization.
+            """
+            stripped = trace_text.strip()
+            if stripped.startswith("<think>"):
+                trace_content = stripped
+            else:
+                trace_content = f"<think>\n{stripped}\n</think>"
+
+            messages_raw: list[dict[str, str]] = [
+                {"role": "user", "content": student_prompt_content},
+                {"role": "assistant", "content": trace_content},
+                {"role": "user", "content": refine_prompt_text},
+            ]
+
+            teacher_ml: list[dict[str, Any]] = []
+            prev_formatted = ""
+            for j, msg in enumerate(messages_raw):
+                is_last = j == len(messages_raw) - 1
+                formatted_full: str = tokenizer.apply_chat_template(  # type: ignore
+                    messages_raw[: j + 1],
+                    tokenize=False,
+                    add_generation_prompt=is_last,
+                    add_special_tokens=False,
+                )
+                diff_idx = get_first_index_that_differs(
+                    prev_formatted, formatted_full
+                )
+                chunk = formatted_full[diff_idx:]
+
+                new_msg: dict[str, Any] = {
+                    "role": msg["role"],
+                    "content": chunk,
+                }
+                new_msg["token_ids"] = tokenizer(
+                    chunk,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                )["input_ids"][0]
+                teacher_ml.append(new_msg)
+                prev_formatted = formatted_full
+
+            return teacher_ml
+
+        if task_data_spec.teacher_refine_prompt is not None:
+            # Multi-turn refine mode takes priority over the legacy single-message
+            # teacher prompt. The teacher sees the same problem framing as the
+            # student (formatted_content), then the static trace as an assistant
+            # turn, then the refine instruction.
+            trace_text = format_kwargs.get("trace", "")
+            teacher_message_log = _build_multiturn_teacher_ml(
+                student_prompt_content=formatted_content,
+                trace_text=trace_text,
+                refine_prompt_text=task_data_spec.teacher_refine_prompt,
+            )
+        elif task_data_spec.teacher_prompt is not None:
             teacher_message_log = _build_teacher_ml(task_data_spec.teacher_prompt)
 
         if task_data_spec.teacher_prefix_prompt is not None:

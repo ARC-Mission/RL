@@ -1,29 +1,33 @@
 #!/bin/bash
-# Allocate an accelerated-h100 node for 2 days inside a tmux session.
-# Usage: ./salloc_tmux.sh [name]   (default: gpu0)
-# Hoard multiple nodes: ./salloc_tmux.sh gpu0 && ./salloc_tmux.sh gpu1
-# Jump in:  tmux attach -t gpu0
+# Allocate 2x4 accelerated-h100 nodes for 1 day inside tmux sessions.
+# Each run uses a unique timestamp tag so it never collides with existing sessions/jobs.
+# Usage: ./salloc_tmux.sh
 # Jump out: Ctrl+b, then d
 # Once attached, run:  srun --pty bash
 
-SESSION="${1:-gpu0}"
+NUM_SESSIONS=2
+TAG=$(date +%m%d-%H%M%S)
+CREATED=()
 
-if tmux has-session -t "$SESSION" 2>/dev/null; then
-    echo "Session '$SESSION' already exists. Attaching..."
-    exec tmux attach -t "$SESSION"
-fi
+for i in $(seq 0 $((NUM_SESSIONS - 1))); do
+    SESSION="gpu${i}-${TAG}"
 
-tmux new-session -d -s "$SESSION" \
-    salloc --partition=accelerated \
-           --account=hk-project-p0023960 \
-           --nodes=1 \
-           --gres=gpu:4 \
-           --time=2-00:00:00 \
-           --job-name=interactive
+    tmux new-session -d -s "$SESSION" \
+        salloc --partition=accelerated \
+               --account=hk-project-p0023960 \
+               --nodes=4 \
+               --gres=gpu:4 \
+               --time=1-00:00:00 \
+               --job-name="$SESSION"
 
-echo "Started tmux session: $SESSION"
+    echo "Started tmux session: $SESSION  (4 nodes, 1 day)"
+    CREATED+=("$SESSION")
+done
+
 echo ""
-echo "  Attach:  tmux attach -t $SESSION"
-echo "  Detach:  Ctrl+b, then d"
-echo "  On node: srun --pty bash"
-echo "  Kill:    tmux kill-session -t $SESSION"
+echo "  Sessions: ${CREATED[*]}"
+echo "  Attach:   tmux attach -t ${CREATED[0]}"
+echo "  Detach:   Ctrl+b, then d"
+echo "  On node:  srun --pty bash"
+echo "  Kill:     tmux kill-session -t ${CREATED[0]}"
+echo "  Kill all: tmux kill-server"

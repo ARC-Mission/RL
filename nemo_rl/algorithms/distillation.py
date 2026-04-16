@@ -677,11 +677,17 @@ def _apply_teacher_student_prefix_mix(
             else:
                 repeated_batch["teacher_message_log"][i] = repeated_batch["message_log"][i]
             selected_prefix_lengths.append(
-                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+                sum(
+                    len(m["token_ids"])
+                    for m in repeated_batch["teacher_message_log"][i]
+                )
             )
         else:
             teacher_prompt_lengths.append(
-                len(repeated_batch["teacher_message_log"][i][0]["token_ids"])
+                sum(
+                    len(m["token_ids"])
+                    for m in repeated_batch["teacher_message_log"][i]
+                )
             )
 
     selected_count = float(len(selected_index_set))
@@ -709,23 +715,40 @@ def _apply_teacher_student_prefix_mix(
 def _inject_student_rollout_into_teacher_message_logs(
     repeated_batch: BatchedDataDict[DatumSpec],
 ) -> None:
-    """Populate teacher logs with student rollout turns without double-injecting."""
+    """Append the live student rollout to each teacher message log so the teacher can score it.
+
+    Pre-existing teacher messages — including any *injected* static trace
+    (assistant turn) added upstream in multi-turn refine mode — are marked as
+    context (loss_mask=0). Only the appended live rollout is scored
+    (loss_mask=1).
+
+    Backward compatibility: in legacy single-user-message teacher mode, the
+    pre-existing single user turn is masked to 0 and the appended student
+    assistant gets mask=1 — identical to the previous role-based logic.
+    """
     for i, student_ml in enumerate(repeated_batch["message_log"]):
         teacher_ml = repeated_batch["teacher_message_log"][i]
         teacher_already_has_rollout = teacher_ml is student_ml
         if teacher_already_has_rollout:
             teacher_ml = deepcopy(teacher_ml)
             repeated_batch["teacher_message_log"][i] = teacher_ml
+            # Came from student — standard role-based masking.
+            for msg in teacher_ml:
+                if msg["role"] == "assistant":
+                    msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
+                else:
+                    msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
         else:
+            # All pre-existing teacher messages are context (loss_mask=0).
+            # In multi-turn refine mode this includes the injected static trace.
+            for msg in teacher_ml:
+                msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+            # Append the live student rollout — this is what the teacher scores.
             for msg in student_ml:
                 if msg["role"] != "user":
-                    teacher_ml.append(deepcopy(msg))
-
-        for msg in teacher_ml:
-            if msg["role"] == "assistant":
-                msg["token_loss_mask"] = torch.ones_like(msg["token_ids"])
-            else:
-                msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
+                    copied = deepcopy(msg)
+                    copied["token_loss_mask"] = torch.ones_like(copied["token_ids"])
+                    teacher_ml.append(copied)
 
 
 def _debug_print_first_sample(

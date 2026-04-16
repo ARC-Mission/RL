@@ -1,0 +1,4 @@
+Rewrite your previous reasoning if necessary and output the refined reasoning and solution. 
+For sections that need more effort you can expand your reasoning if needed, for sections with less effort you should be slightly more concise. 
+
+Write your new solution and put the final answer in \boxed{}.

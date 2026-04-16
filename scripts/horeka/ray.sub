@@ -1,0 +1,238 @@
+#!/bin/bash
+# Horeka bare-metal Ray multi-node launcher for NeMo-RL.
+# Run from inside an existing salloc allocation (e.g. via salloc_tmux.sh
+# then srun --pty bash).
+#
+# Usage:
+#   COMMAND="uv run python examples/run_distillation.py --config ..." \
+#     bash scripts/horeka/ray.sub
+#
+# Optional env vars (all have sensible defaults):
+#   NEMO_DIR, UV_PROJECT_ENVIRONMENT, GPUS_PER_NODE, CPUS_PER_WORKER,
+#   NETWORK_IFACE, HF_HOME, WANDB_MODE, HF_HUB_OFFLINE
+
+set -euo pipefail
+
+# ── Repo root ────────────────────────────────────────────────────────────────
+if [[ -n "${NEMO_DIR:-}" ]]; then
+  REPO_ROOT="$NEMO_DIR"
+elif REPO_ROOT="$(git -C "${SLURM_SUBMIT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"; then
+  :
+else
+  echo "[ERROR] Could not determine repository root."
+  echo "        Run from inside the repo or set NEMO_DIR=/abs/path/to/RL"
+  exit 1
+fi
+cd "$REPO_ROOT"
+
+# ── Modules (Horeka) ────────────────────────────────────────────────────────
+module purge
+module load compiler/gnu/13
+module load devel/cuda/12.9
+
+# compiler/gnu/13 sets OMP_PROC_BIND=true → crashes Ray's RuntimeEnvAgent
+unset OMP_PROC_BIND OMP_PLACES
+
+export CUDA_HOME=${CUDA_DIR:-$CUDA_HOME}
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+
+# Expose pip NCCL so Transformer Engine can compile
+NCCL_PKG_DIR=$(uv run python -c "import nvidia.nccl; print(nvidia.nccl.__path__[0])" 2>/dev/null || true)
+if [[ -n "$NCCL_PKG_DIR" ]]; then
+  export CPATH=${NCCL_PKG_DIR}/include:${CPATH:-}
+  export LD_LIBRARY_PATH=${NCCL_PKG_DIR}/lib:$LD_LIBRARY_PATH
+fi
+
+export NVTE_SKIP_SANITY_CHECKS=1
+
+# ── SLURM sanity ─────────────────────────────────────────────────────────────
+: "${SLURM_JOB_ID:?Must be run inside a SLURM allocation}"
+: "${SLURM_JOB_NODELIST:?SLURM_JOB_NODELIST not set}"
+
+# When inside srun --pty, step-level vars may say 1 node — derive from
+# the allocation's nodelist instead.
+mapfile -t nodes < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
+NUM_NODES="${#nodes[@]}"
+
+# Scrub step-level overrides so Ray/torch see the full allocation.
+unset SLURM_NNODES SLURM_NTASKS SLURM_NPROCS \
+      SLURM_NODELIST SLURM_STEP_NODELIST SLURM_STEP_NUM_NODES
+export SLURM_JOB_NUM_NODES="$NUM_NODES"
+
+# ── Venv / Ray ───────────────────────────────────────────────────────────────
+VENV="${UV_PROJECT_ENVIRONMENT:-$REPO_ROOT/.venv}"
+export UV_PROJECT_ENVIRONMENT="$VENV"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+if [[ -x "$VENV/bin/ray" ]]; then
+  RAY_BIN="$VENV/bin/ray"
+elif command -v ray >/dev/null 2>&1; then
+  RAY_BIN="$(command -v ray)"
+else
+  echo "[ERROR] ray not found — run scripts/horeka/install-horeka.sh first."
+  exit 1
+fi
+
+# ── Cache / HF / WANDB ──────────────────────────────────────────────────────
+CACHE_ROOT="/hkfs/work/workspace/scratch/tum_hki2875-myspace/.cache"
+JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-$CACHE_ROOT/jobs/$SLURM_JOB_ID}"
+export HF_HOME="${HF_HOME:-$CACHE_ROOT/huggingface}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+export VLLM_NO_USAGE_STATS=1
+export VLLM_DO_NOT_TRACK=1
+
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$JOB_CACHE_ROOT/xdg-cache}"
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$JOB_CACHE_ROOT/xdg-config}"
+export NEMO_RL_VLLM_CACHE_BASE="${NEMO_RL_VLLM_CACHE_BASE:-$JOB_CACHE_ROOT/vllm}"
+export NEMO_RL_VLLM_CONFIG_BASE="${NEMO_RL_VLLM_CONFIG_BASE:-$JOB_CACHE_ROOT/vllm-config}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$JOB_CACHE_ROOT/torch_inductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$JOB_CACHE_ROOT/triton}"
+export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-$JOB_CACHE_ROOT/flashinfer}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$JOB_CACHE_ROOT/torch_extensions}"
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/${USER}/ray-${SLURM_JOB_ID}}"
+
+mkdir -p "$RAY_TMPDIR" "$HF_HOME" \
+  "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
+  "$NEMO_RL_VLLM_CACHE_BASE" "$NEMO_RL_VLLM_CONFIG_BASE" \
+  "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" \
+  "$FLASHINFER_CACHE_DIR" "$TORCH_EXTENSIONS_DIR"
+
+if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
+  ulimit -Sn 65535
+fi
+
+# ── Networking (Horeka accelerated IB = ibs1) ────────────────────────────────
+export NETWORK_IFACE="${NETWORK_IFACE:-ibs1}"
+export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$NETWORK_IFACE}"
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+
+# ── Ray multi-node setup ────────────────────────────────────────────────────
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+CPUS_PER_WORKER="${CPUS_PER_WORKER:-${SLURM_CPUS_PER_TASK:-32}}"
+RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
+LOG_DIR="${LOG_DIR:-$REPO_ROOT/scripts/logs/${SLURM_JOB_ID}-ray}"
+mkdir -p "$LOG_DIR"
+
+head_node="${nodes[0]}"
+declare -a SRUN_PIDS=()
+DRIVER_RC=""
+
+cleanup() {
+  local rc=$?
+  set +e
+  echo "[INFO] Cleaning up Ray processes..."
+  for pid in "${SRUN_PIDS[@]}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  for node in "${nodes[@]}"; do
+    srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+  done
+  return "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+get_node_ip() {
+  srun --overlap -N1 -n1 -w "$1" \
+    bash -lc "ip -4 -o addr show dev '$NETWORK_IFACE' | awk '{split(\$4, a, \"/\"); print a[1]}' | head -n1" \
+    2>/dev/null || true
+}
+
+echo "[INFO] Job $SLURM_JOB_ID — $NUM_NODES nodes: ${nodes[*]}"
+echo "[INFO] Interface: $NETWORK_IFACE  GPUs/node: $GPUS_PER_NODE"
+
+# Resolve IPs
+declare -A NODE_IPS=()
+for node in "${nodes[@]}"; do
+  ip="$(get_node_ip "$node")"
+  [[ -z "$ip" ]] && { echo "[ERROR] No IPv4 for $node on $NETWORK_IFACE"; exit 1; }
+  NODE_IPS["$node"]="$ip"
+  echo "[INFO]   $node -> $ip"
+done
+
+# Stop stale Ray everywhere
+for node in "${nodes[@]}"; do
+  srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+done
+
+# Head
+head_ip="${NODE_IPS[$head_node]}"
+head_addr="${head_ip}:$RAY_PORT"
+echo "[INFO] Starting Ray head on $head_node ($head_ip)"
+srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
+  "$RAY_BIN" start --head \
+  --temp-dir="$RAY_TMPDIR" \
+  --node-ip-address="$head_ip" \
+  --port="$RAY_PORT" \
+  --dashboard-port="$RAY_DASHBOARD_PORT" \
+  --dashboard-host="$head_ip" \
+  --num-cpus="$CPUS_PER_WORKER" \
+  --num-gpus="$GPUS_PER_NODE" \
+  --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+  --disable-usage-stats \
+  --block &
+SRUN_PIDS+=($!)
+
+echo "[INFO] Waiting for Ray head at $head_addr..."
+for attempt in $(seq 1 30); do
+  kill -0 "${SRUN_PIDS[0]}" 2>/dev/null || {
+    echo "[ERROR] Ray head died. See $LOG_DIR/ray-head.log"; exit 1; }
+  srun --overlap -N1 -n1 -w "$head_node" \
+    "$RAY_BIN" status --address "$head_addr" >/dev/null 2>&1 && break
+  [[ "$attempt" -eq 30 ]] && { echo "[ERROR] Timed out"; exit 1; }
+  sleep 2
+done
+echo "[INFO] Ray head ready"
+
+# Workers
+for ((i = 1; i < ${#nodes[@]}; i++)); do
+  w="${nodes[$i]}"; wip="${NODE_IPS[$w]}"
+  echo "[INFO] Starting Ray worker on $w ($wip)"
+  srun --overlap -N1 -n1 -w "$w" -o "$LOG_DIR/ray-worker-$i.log" \
+    "$RAY_BIN" start \
+    --temp-dir="$RAY_TMPDIR" \
+    --address "$head_addr" \
+    --node-ip-address="$wip" \
+    --num-cpus="$CPUS_PER_WORKER" \
+    --num-gpus="$GPUS_PER_NODE" \
+    --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
+    --disable-usage-stats \
+    --block &
+  SRUN_PIDS+=($!)
+  sleep 2
+done
+
+# Wait for all worker_units
+EXPECTED=$((GPUS_PER_NODE * NUM_NODES))
+echo "[INFO] Waiting for worker_units=$EXPECTED..."
+for attempt in $(seq 1 60); do
+  ACTIVE="$(srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" 2>&1 \
+    | awk '/worker_units/{if(match($0,/[0-9]+(\.[0-9]+)?\/[0-9]+(\.[0-9]+)?/)){split(substr($0,RSTART,RLENGTH),a,"/");print int(a[2]+0);found=1;exit}}END{if(!found)print 0}' || echo 0)"
+  echo "[INFO] [$attempt/60] worker_units: $ACTIVE/$EXPECTED"
+  [[ "$ACTIVE" -eq "$EXPECTED" ]] && { echo "[INFO] All $EXPECTED GPUs online."; break; }
+  [[ "$attempt" -eq 60 ]] && { echo "[ERROR] Timed out"; exit 1; }
+  sleep 5
+done
+
+# ── Run driver ───────────────────────────────────────────────────────────────
+COMMAND="${COMMAND:-}"
+if [[ -n "$COMMAND" ]]; then
+  echo "[INFO] Running: $COMMAND"
+  set +e
+  eval "$COMMAND" 2>&1 | tee "$LOG_DIR/driver.log"
+  DRIVER_RC=${PIPESTATUS[0]}
+  set -e
+  echo "[INFO] Driver exit code: $DRIVER_RC"
+  exit "$DRIVER_RC"
+else
+  echo "[INFO] No COMMAND set. Ray cluster is idle."
+  echo "[INFO] Run:  COMMAND='...' bash scripts/horeka/ray.sub"
+  sleep infinity
+fi

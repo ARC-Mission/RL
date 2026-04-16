@@ -87,6 +87,9 @@ def create_local_venv(
     #  context.
     #  https://docs.astral.sh/uv/concepts/projects/config/#project-environment-path
     env["UV_PROJECT_ENVIRONMENT"] = venv_path
+    # Ray sets CUDA_VISIBLE_DEVICES="" for tasks with num_gpus=0, hiding all GPUs.
+    # Some packages (e.g. nv-grouped-gemm) need CUDA visible at build time.
+    env.pop("CUDA_VISIBLE_DEVICES", None)
 
     # Split the py_executable into command and arguments
     exec_cmd = shlex.split(py_executable)

@@ -1,16 +1,22 @@
-# Distillation: Qwen3-8B self-distill, v14 teacher prompt sweep, GBS=64
-# Cluster: Jülich — 2 nodes × 4 A100 GPUs
+# Distillation: Qwen3-8B self-distill, multi-turn refine mode, GBS=64
+# Cluster: Jülich — 2 nodes × 4 A100 GPUs (defaults; launch scripts may override)
 # DP = total_gpus / (TP × CP) = 8 / (4 × 2) = 1
-# Generation: 16k tokens, teacher sequence: ~33k (16k static trace + 800 instr + 16k student ans)
+#
+# Teacher message log (multi-turn refine):
+#   [user(problem)]                                          ← same framing as student (cot.txt)
+#   [assistant(<think>{static dataset trace}</think>)]       ← injected: synthetic context
+#   [user(refine.txt instruction)]
+#   [assistant(live student rollout)]                        ← presented to be scored
+#
+# Teacher sequence: ~33k (problem ~400 + static trace ~16k + refine instr ~200 + student ans ~16k)
 # topk=512, reverse KL, bs=64
 #
-# Teacher prompt: examples/prompts/teacher_rewrite_v14_independent_check_improved.txt
-#   {problem}  ← from dataset messages[0]
-#   {trace}    ← mapped from column `qwen3_8b_answer` via data.default.column_mapping
+# Refine prompt:  examples/prompts/refine.txt (static text, no format placeholders)
+# Trace source:   dataset column `qwen3_8b_answer` → {trace} via column_mapping
 # Training dataset: yllkryeziu/openthoughts114k-math-qwen3
 #   Must have a `messages` column so ResponseDataset preserves extra columns.
 #
-# Evals: aime2024, aime2025, aime2026 (each avg@4)
+# Evals: math500, aime2024, aime2025, aime2026 (each avg@4)
 
 distillation:
     num_prompts_per_step: 64
@@ -40,7 +46,7 @@ loss_fn:
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-rewrite"
+    checkpoint_dir: "/p/scratch/scifi/kryeziu1/opsd/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-refine"
     metric_name: null
     higher_is_better: true
     keep_top_k: 3
@@ -210,10 +216,11 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-8B"
-    max_total_sequence_length: 33280  # 16k static trace + 800 instr + 16384 student ans, div by TP×CP×2=16
+    # Multi-turn refine: problem (~400) + <think>trace</think> (~16k) + refine instr (~200) + student ans (~16k)
+    max_total_sequence_length: 33280
     dtensor_cfg:
         <<: *DTENSOR_BASE
-        context_parallel_size: 2  # increased from 1 — needed for 33k-token sequences
+        context_parallel_size: 2  # needed for 33k-token sequences
         tensor_parallel_size: 4
     dynamic_batching:
         enabled: true
@@ -229,17 +236,21 @@ data:
         - dataset_name: AIME2024
           repeat: 4
           teacher_prompt_file: null
+          teacher_refine_prompt_file: null
         - dataset_name: AIME2025
           repeat: 4
           teacher_prompt_file: null
+          teacher_refine_prompt_file: null
         - dataset_name: AIME2026
           repeat: 4
           teacher_prompt_file: null
+          teacher_refine_prompt_file: null
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        teacher_prompt_file: "examples/prompts/teacher_rewrite_v14_independent_check_improved.txt"
+        teacher_prompt_file: null
         teacher_prefix_prompt_file: null
+        teacher_refine_prompt_file: "examples/prompts/refine.txt"
         env_name: "math"
         column_mapping:
             qwen3_8b_answer: trace
@@ -249,7 +260,7 @@ env:
         num_workers: 8
 
 logger:
-    log_dir: "logs/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-rewrite"
+    log_dir: "logs/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-refine"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -261,10 +272,10 @@ logger:
         flush_interval: 10
     wandb:
         project: "nemo-distillation"
-        name: "distillation-rewrite-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "distillation-refine-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
     swanlab:
         project: "nemo-distillation"
-        name: "distillation-rewrite-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "distillation-refine-${data.train.dataset_name}-${teacher.model_name}-to-${policy.model_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
 
 cluster:
     gpus_per_node: 4

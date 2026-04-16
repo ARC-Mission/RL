@@ -50,6 +50,11 @@ class ResponseDatasetConfig(TypedDict):
     # student's message_log.  When absent, the legacy behaviour (copy the
     # student message_log) is preserved.
     teacher_prefix_prompt_file: NotRequired[str | None]
+    # Teacher refinement prompt file. When set, the teacher message log is built
+    # as a multi-turn conversation: [user(problem), assistant(<think>{trace}</think>),
+    # user(refine_instruction)]. The live student rollout is then appended for
+    # scoring. Takes priority over teacher_prompt_file when both are set.
+    teacher_refine_prompt_file: NotRequired[str | None]
 
 
 class PreferenceDatasetConfig(TypedDict):

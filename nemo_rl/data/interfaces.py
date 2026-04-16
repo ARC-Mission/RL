@@ -62,6 +62,11 @@ class TaskDataSpec:
 
     teacher_prompt_file: Optional[PathLike] = None
     teacher_prefix_prompt_file: Optional[PathLike] = None
+    # When set, enables multi-turn refine mode: the teacher message log is built
+    # as [user(problem), assistant(<think>{trace}</think>), user(refine)] instead
+    # of a single user message containing the rewrite prompt. The live student
+    # rollout is then appended for scoring.
+    teacher_refine_prompt_file: Optional[PathLike] = None
     column_mapping: dict = field(default_factory=dict)
 
     # Trace conditioning mode: "full", "truncate", "mask", or "none"
@@ -89,6 +94,7 @@ class TaskDataSpec:
         self.prompt = load_prompt_file(self.prompt_file)
         self.teacher_prompt = load_prompt_file(self.teacher_prompt_file)
         self.teacher_prefix_prompt = load_prompt_file(self.teacher_prefix_prompt_file)
+        self.teacher_refine_prompt = load_prompt_file(self.teacher_refine_prompt_file)
 
     def copy_defaults(self, from_spec: "TaskDataSpec") -> None:
         """Apply default values from another Task instance for any None attributes."""
@@ -97,6 +103,7 @@ class TaskDataSpec:
             "prompt": from_spec.prompt,
             "teacher_prompt": from_spec.teacher_prompt,
             "teacher_prefix_prompt": from_spec.teacher_prefix_prompt,
+            "teacher_refine_prompt": from_spec.teacher_refine_prompt,
             "column_mapping": from_spec.column_mapping,
             "trace_mode": from_spec.trace_mode,
             "trace_truncate_fraction": from_spec.trace_truncate_fraction,
