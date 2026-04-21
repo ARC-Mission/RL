@@ -492,6 +492,7 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        compute_teacher_entropy: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Dispatch get_topk_logits to workers (no CP/packed support initially)."""
         dp_size = self.sharding_annotations.get_axis_size("data_parallel")
@@ -542,7 +543,11 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                     "tensor_parallel",
                     "pipeline_parallel",
                 ],
-                common_kwargs={"k": k, "micro_batch_size": micro_batch_size},
+                common_kwargs={
+                    "k": k,
+                    "micro_batch_size": micro_batch_size,
+                    "compute_teacher_entropy": compute_teacher_entropy,
+                },
             )
 
         # Avoid BatchedDataDict.from_batches here because it flattens rows for tensors with ndim>2 ([B,S,k] -> [B,S*k]).
@@ -553,6 +558,10 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
         stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
         stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+
+        if compute_teacher_entropy and "teacher_entropy" in worker_batches[0]:
+            all_entropy = [wb["teacher_entropy"] for wb in worker_batches]
+            stacked["teacher_entropy"] = torch.cat(all_entropy, dim=0)
 
         if self.use_dynamic_batches or self.use_sequence_packing:
             stacked.reorder_data(unsorted_data_indices)

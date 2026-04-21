@@ -44,6 +44,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedEntropy,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -476,9 +477,10 @@ class LogprobsPostProcessor:
 
 
 class TopkLogitsPostProcessor:
-    def __init__(self, cfg: PolicyConfig, k: int):
+    def __init__(self, cfg: PolicyConfig, k: int, compute_teacher_entropy: bool = False):
         self.cfg = cfg
         self.k = k
+        self.compute_teacher_entropy = compute_teacher_entropy
 
     def __call__(
         self,
@@ -523,6 +525,16 @@ class TopkLogitsPostProcessor:
                 chunk_size=chunk_size,
             )
 
+            teacher_entropy_local = None
+            if self.compute_teacher_entropy:
+                entropy_chunk_size = chunk_size if chunk_size is not None else output_tensor.shape[1]
+                teacher_entropy_local = ChunkedDistributedEntropy.apply(
+                    output_tensor.to(torch.float32),
+                    entropy_chunk_size,
+                    tp_grp,
+                    True,  # inference_only
+                )  # [B, S]
+
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()
                 if pack:
@@ -540,6 +552,12 @@ class TopkLogitsPostProcessor:
                         dtype=topk_idx_local.dtype,
                         device=topk_idx_local.device,
                     )
+                    if teacher_entropy_local is not None:
+                        teacher_entropy_full = torch.zeros(
+                            (1, total_packed_len),
+                            dtype=teacher_entropy_local.dtype,
+                            device=teacher_entropy_local.device,
+                        )
 
                     for i in range(batch_size):
                         start_idx = int(cu_seqlens_padded[i].item())
@@ -576,6 +594,17 @@ class TopkLogitsPostProcessor:
                                 )
                             topk_vals_full[:, start_idx:end_idx, :] = gathered_vals
                             topk_idx_full[:, start_idx:end_idx, :] = gathered_idx
+
+                            if teacher_entropy_local is not None:
+                                local_ent_slice = teacher_entropy_local[
+                                    :, start_idx // cp_size : end_idx // cp_size
+                                ]
+                                gathered_ent = allgather_cp_sharded_tensor(
+                                    local_ent_slice, cp_grp, seq_dim=1
+                                )
+                                if gathered_ent.dim() == 2 and gathered_ent.shape[1] != expected_len:
+                                    gathered_ent = gathered_ent.reshape(1, expected_len)
+                                teacher_entropy_full[:, start_idx:end_idx] = gathered_ent
                 else:
                     # Sequence packing must be enabled when CP > 1
                     raise RuntimeError(
@@ -584,6 +613,8 @@ class TopkLogitsPostProcessor:
             else:
                 topk_vals_full = topk_vals_local
                 topk_idx_full = topk_idx_local
+                if teacher_entropy_local is not None:
+                    teacher_entropy_full = teacher_entropy_local
 
             if pack:
                 batch_size = data_dict["input_ids"].shape[0]
@@ -597,6 +628,12 @@ class TopkLogitsPostProcessor:
                     dtype=topk_idx_full.dtype,
                     device=topk_idx_full.device,
                 )
+                if teacher_entropy_local is not None:
+                    out_ent = torch.zeros(
+                        (batch_size, unpacked_seqlen),
+                        dtype=teacher_entropy_full.dtype,
+                        device=teacher_entropy_full.device,
+                    )
                 for i in range(batch_size):
                     seq_len = int(seq_lengths[i].item())
                     start_idx = int(cu_seqlens_padded[i].item())
@@ -607,15 +644,25 @@ class TopkLogitsPostProcessor:
                         out_idx[i, :seq_len, :] = topk_idx_full[
                             0, start_idx : start_idx + seq_len, :
                         ]
-                return output_tensor.new_zeros(()), {
+                        if teacher_entropy_local is not None:
+                            out_ent[i, :seq_len] = teacher_entropy_full[
+                                0, start_idx : start_idx + seq_len
+                            ]
+                result = {
                     "topk_logits": out_vals,
                     "topk_indices": out_idx,
                 }
+                if teacher_entropy_local is not None:
+                    result["teacher_entropy"] = out_ent
+                return output_tensor.new_zeros(()), result
             else:
-                return output_tensor.new_zeros(()), {
+                result = {
                     "topk_logits": topk_vals_full,
                     "topk_indices": topk_idx_full,
                 }
+                if teacher_entropy_local is not None:
+                    result["teacher_entropy"] = teacher_entropy_full
+                return output_tensor.new_zeros(()), result
 
         return processor_fn_inner
 

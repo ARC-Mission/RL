@@ -552,7 +552,8 @@ def _align_teacher_topk_to_student(
     teacher_token_mask: torch.Tensor,
     student_token_mask: torch.Tensor,
     student_seq_len: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    teacher_entropy: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Align teacher topk logits from teacher sequence positions to student sequence positions.
 
     When the teacher uses a different prompt than the student, their sequences have different
@@ -567,6 +568,9 @@ def _align_teacher_topk_to_student(
 
     aligned_logits = torch.zeros(B, student_seq_len, k, dtype=teacher_topk_logits.dtype)
     aligned_indices = torch.zeros(B, student_seq_len, k, dtype=teacher_topk_indices.dtype)
+    aligned_entropy = None
+    if teacher_entropy is not None:
+        aligned_entropy = torch.zeros(B, student_seq_len, dtype=teacher_entropy.dtype)
 
     for i in range(B):
         teacher_resp = teacher_token_mask[i].nonzero(as_tuple=True)[0]
@@ -575,6 +579,8 @@ def _align_teacher_topk_to_student(
         if n > 0:
             aligned_logits[i, student_resp[:n]] = teacher_topk_logits[i, teacher_resp[:n]]
             aligned_indices[i, student_resp[:n]] = teacher_topk_indices[i, teacher_resp[:n]]
+            if aligned_entropy is not None:
+                aligned_entropy[i, student_resp[:n]] = teacher_entropy[i, teacher_resp[:n]]
 
             # Also copy the teacher logits from the position just before the first
             # response token: logits[resp[0]-1] predicts the first response token.
@@ -583,8 +589,10 @@ def _align_teacher_topk_to_student(
             if t_prev >= 0 and s_prev >= 0:
                 aligned_logits[i, s_prev] = teacher_topk_logits[i, t_prev]
                 aligned_indices[i, s_prev] = teacher_topk_indices[i, t_prev]
+                if aligned_entropy is not None:
+                    aligned_entropy[i, s_prev] = teacher_entropy[i, t_prev]
 
-    return aligned_logits, aligned_indices
+    return aligned_logits, aligned_indices, aligned_entropy
 
 
 def _get_scheduled_teacher_student_prefix_fraction(
@@ -1114,6 +1122,7 @@ def distillation_train(
                         teacher_data,
                         k=master_config["distillation"]["topk_logits_k"],
                         timer=timer,
+                        compute_teacher_entropy=loss_fn.egmd_enabled,
                     )
 
                     # Downcast indices from int64 to int32 to halve CPU memory
@@ -1122,20 +1131,27 @@ def distillation_train(
                         torch.int32
                     )
 
+                    teacher_ent = teacher_topk.get("teacher_entropy", None)
+
                     if has_teacher_ml:
                         # Align teacher topk logits to student sequence positions
-                        aligned_logits, aligned_indices = _align_teacher_topk_to_student(
+                        aligned_logits, aligned_indices, aligned_entropy = _align_teacher_topk_to_student(
                             teacher_topk_logits=teacher_topk["topk_logits"],
                             teacher_topk_indices=teacher_topk["topk_indices"],
                             teacher_token_mask=teacher_data["token_mask"],
                             student_token_mask=train_data["token_mask"],
                             student_seq_len=train_data["input_ids"].shape[1],
+                            teacher_entropy=teacher_ent,
                         )
                         train_data["teacher_topk_logits"] = aligned_logits
                         train_data["teacher_topk_indices"] = aligned_indices
+                        if aligned_entropy is not None:
+                            train_data["teacher_entropy"] = aligned_entropy
                     else:
                         train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
+                        if teacher_ent is not None:
+                            train_data["teacher_entropy"] = teacher_ent
                     if total_steps == 0:
                         _debug_print_first_sample(train_data, teacher_data, tokenizer)
 
@@ -1228,6 +1244,20 @@ def distillation_train(
                     "total_num_tokens": input_lengths.numpy(),
                 }
                 metrics.update(train_results["all_mb_metrics"])
+
+                # Extract histogram data before scalar aggregation
+                hist_data: dict[str, list] = {}
+                for k in list(metrics.keys()):
+                    if k.startswith("_hist/"):
+                        vals = metrics.pop(k)
+                        combined = []
+                        for v in (vals if isinstance(vals, list) else [vals]):
+                            if isinstance(v, list):
+                                combined.extend(v)
+                            else:
+                                combined.append(v)
+                        hist_data[k[len("_hist/"):]] = combined
+
                 for k, v in metrics.items():
                     if k in {
                         "lr",
@@ -1401,6 +1431,8 @@ def distillation_train(
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            for hist_name, hist_values in hist_data.items():
+                logger.log_histogram(hist_values, total_steps + 1, name=f"train/{hist_name}")
 
             timer.reset()
             current_step += 1

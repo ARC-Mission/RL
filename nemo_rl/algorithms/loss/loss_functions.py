@@ -884,6 +884,10 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    egmd_enabled: bool
+    egmd_beta: float
+    egmd_percentile_p: float
+    egmd_alpha: float
 
 
 class DistillationLossDataDict(TypedDict):
@@ -893,6 +897,7 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    teacher_entropy: torch.Tensor | None
 
 
 class DistillationLossFn(LossFunction):
@@ -907,10 +912,19 @@ class DistillationLossFn(LossFunction):
         self.zero_outside_topk = cfg["zero_outside_topk"]
         self.log_infinitesimal = -100
 
+        self.egmd_enabled = cfg.get("egmd_enabled", False)
+        self.egmd_beta = cfg.get("egmd_beta", 5.0)
+        self.egmd_percentile_p = cfg.get("egmd_percentile_p", 0.6)
+        self.egmd_alpha = cfg.get("egmd_alpha", 0.0)
+
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
         )
+        if self.egmd_enabled:
+            assert self.kl_type != "forward", (
+                "EGMD is only supported with reverse or mixed KL"
+            )
 
     def __call__(
         self,
@@ -963,7 +977,59 @@ class DistillationLossFn(LossFunction):
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
             mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            # align mask shape to per_token_kl
+        else:
+            mask = None
+
+        # EGMD: entropy-gap modulated distillation
+        egmd_metrics: dict[str, Any] = {}
+        if self.egmd_enabled:
+            teacher_entropy = data["teacher_entropy"][:, 1:][:, :max_len]
+            # delta = H_student - H_teacher (spec convention)
+            # H_all = sum(p*logp) = -H_student, teacher_entropy = -H_teacher
+            delta = teacher_entropy - H_all
+
+            valid_mask = mask.bool() if mask is not None else torch.ones_like(delta, dtype=torch.bool)
+            valid_deltas = delta[valid_mask]
+            tau = torch.quantile(valid_deltas.float(), self.egmd_percentile_p)
+
+            w = torch.sigmoid(-self.egmd_beta * (delta - tau)).detach()
+
+            per_token_kl_raw = per_token_kl
+
+            per_token_kl = w * per_token_kl
+            if self.egmd_alpha > 0:
+                # H_all = -H_student (negative), so alpha * (1-w) * H_all is the
+                # entropy bonus: minimizing this term maximizes student entropy
+                # at high-delta positions where (1-w) is large
+                entropy_bonus = self.egmd_alpha * (1.0 - w) * H_all
+                per_token_kl = per_token_kl + entropy_bonus
+
+            # Diagnostics
+            with torch.no_grad():
+                high_delta = (w < 0.3) & valid_mask
+                low_delta = (w > 0.7) & valid_mask
+                valid_w = w[valid_mask]
+
+                egmd_metrics["egmd/mean_w"] = valid_w.mean().item()
+                egmd_metrics["egmd/tau"] = tau.item()
+                egmd_metrics["egmd/frac_high_delta"] = high_delta.sum().item() / max(valid_mask.sum().item(), 1)
+                egmd_metrics["egmd/frac_low_delta"] = low_delta.sum().item() / max(valid_mask.sum().item(), 1)
+                egmd_metrics["egmd/delta_mean"] = valid_deltas.mean().item()
+                egmd_metrics["egmd/delta_std"] = valid_deltas.std().item() if valid_deltas.numel() > 1 else 0.0
+                egmd_metrics["egmd/H_student_mean"] = (-H_all[valid_mask]).mean().item()
+                egmd_metrics["egmd/H_teacher_mean"] = (-teacher_entropy[valid_mask]).mean().item()
+
+                if high_delta.any():
+                    egmd_metrics["egmd/kl_at_high_delta"] = per_token_kl_raw[high_delta].mean().item()
+                if low_delta.any():
+                    egmd_metrics["egmd/kl_at_low_delta"] = per_token_kl_raw[low_delta].mean().item()
+                if self.egmd_alpha > 0:
+                    egmd_metrics["egmd/entropy_bonus_mean"] = (self.egmd_alpha * (1.0 - w) * H_all)[valid_mask].mean().item()
+
+                egmd_metrics["_hist/egmd_delta"] = valid_deltas.cpu().tolist()
+                egmd_metrics["_hist/egmd_w"] = valid_w.cpu().tolist()
+
+        if mask is not None:
             kl_loss = masked_mean(
                 per_token_kl,
                 mask,
@@ -975,6 +1041,7 @@ class DistillationLossFn(LossFunction):
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "num_valid_samples": data["input_ids"].shape[0],
+            **egmd_metrics,
         }
 
         return kl_loss, metrics

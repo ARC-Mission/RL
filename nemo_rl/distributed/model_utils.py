@@ -1629,11 +1629,28 @@ def get_distillation_topk_logprobs_from_logits(
                 vocab_end_index=vocab_end_index,
             )
 
+            if calculate_entropy:
+                seq_len_local = int(student_logits.shape[1])
+                chunk_size = max(1, min(seq_len_local, 1024))
+                H_all = ChunkedDistributedEntropy.apply(
+                    student_logits,
+                    chunk_size,
+                    parallel_group if parallel_group is not None else cp_group,
+                    False,
+                )
+
+                if cp_size > 1:
+                    H_all = allgather_cp_sharded_tensor(H_all, cp_group, seq_dim=1)
+
         # Non-distributed processing
         else:
             student_topk_logits = student_logits.gather(
                 dim=-1, index=teacher_topk_indices.long()
             )
+
+            if calculate_entropy:
+                student_logprobs_full = torch.nn.functional.log_softmax(student_logits, dim=-1)
+                H_all = (student_logprobs_full.exp() * student_logprobs_full).sum(-1)
 
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1

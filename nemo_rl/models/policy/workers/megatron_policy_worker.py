@@ -600,6 +600,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         data: BatchedDataDict[GenerationDatumSpec],
         k: int,
         micro_batch_size: Optional[int] = None,
+        compute_teacher_entropy: bool = False,
     ):
         """Get the top-k logits and indices for a batch of data.
 
@@ -609,6 +610,7 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             BatchedDataDict containing:
                 - topk_logits: Tensor of top-k logits for each position in the sequence
                 - topk_indices: Tensor of top-k indices for each position in the sequence
+                - teacher_entropy: (optional) Tensor of per-token entropy [B, S] when compute_teacher_entropy=True
         """
         no_grad = torch.no_grad()
         no_grad.__enter__()
@@ -642,7 +644,9 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
             seq_length=padded_seq_length,
             mbs=micro_batch_size,
             num_microbatches=num_microbatches,
-            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
+            post_processing_fn=TopkLogitsPostProcessor(
+                cfg=self.cfg, k=k, compute_teacher_entropy=compute_teacher_entropy,
+            ),
             forward_only=True,
             defer_fp32_logits=self.defer_fp32_logits,
             sampling_params=self.sampling_params,
@@ -652,6 +656,8 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
         if is_pipeline_last_stage(ignore_virtual=True):
             logits_chunks = []
             indices_chunks = []
+            entropy_chunks = []
+            has_entropy = False
             for out in list_of_outputs:
                 tk = out["topk_logits"]
                 ti = out["topk_indices"]
@@ -662,6 +668,13 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 logits_chunks.append(tk)
                 indices_chunks.append(ti)
 
+                if "teacher_entropy" in out:
+                    has_entropy = True
+                    te = out["teacher_entropy"]
+                    if pad_len > 0:
+                        te = torch.nn.functional.pad(te, (0, pad_len), value=0.0)
+                    entropy_chunks.append(te)
+
             topk_logits = torch.cat(logits_chunks, dim=0)
             topk_indices = torch.cat(indices_chunks, dim=0)
 
@@ -669,21 +682,27 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
                 "topk_logits": topk_logits,
                 "topk_indices": topk_indices,
             }
+            if has_entropy:
+                tensors_to_broadcast["teacher_entropy"] = torch.cat(entropy_chunks, dim=0)
         else:
             tensors_to_broadcast = {
                 "topk_logits": None,
                 "topk_indices": None,
             }
+            if compute_teacher_entropy:
+                tensors_to_broadcast["teacher_entropy"] = None
 
         # Broadcast tensors from last stage to all stages
         broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
         topk_logits = broadcasted["topk_logits"]
         topk_indices = broadcasted["topk_indices"]
 
+        result = {"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}
+        if "teacher_entropy" in broadcasted:
+            result["teacher_entropy"] = broadcasted["teacher_entropy"].cpu()
+
         no_grad.__exit__(None, None, None)
-        return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
-        )
+        return BatchedDataDict.from_batches([result])
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")
     def generate(

@@ -93,6 +93,7 @@ class PolicyInterface(ABC):
         k: int,
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
+        compute_teacher_entropy: bool = False,
     ) -> BatchedDataDict[TopkLogitsOutputSpec]:
         """Get per-position top-k logits and global indices for a batch of inputs.
 

@@ -1366,6 +1366,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        compute_teacher_entropy: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 

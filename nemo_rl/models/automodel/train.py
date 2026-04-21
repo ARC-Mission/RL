@@ -42,6 +42,7 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
+    ChunkedDistributedEntropy,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
@@ -344,8 +345,10 @@ def forward_with_post_processing_fn(
         if isinstance(post_processing_fn, LogprobsPostProcessor):
             metrics = {"logprobs": result}
         else:
-            vals, idx = result
+            vals, idx, ent = result
             metrics = {"topk_logits": vals, "topk_indices": idx}
+            if ent is not None:
+                metrics["teacher_entropy"] = ent
     elif isinstance(post_processing_fn, ScorePostProcessor):
         result = post_processing_fn(logits=logits)
         metrics = {"scores": result}
@@ -792,6 +795,7 @@ class TopkLogitsPostProcessor:
         cp_size: int,
         k: int,
         enable_seq_packing: bool = False,
+        compute_teacher_entropy: bool = False,
     ):
         """Initialize TopkLogitsPostProcessor.
 
@@ -803,6 +807,7 @@ class TopkLogitsPostProcessor:
             cp_size: Context parallel size
             k: Number of top logits to return
             enable_seq_packing: Whether sequence packing is enabled
+            compute_teacher_entropy: Whether to compute per-token entropy for EGMD
         """
         self.cfg = cfg
         self.device_mesh = device_mesh
@@ -811,6 +816,7 @@ class TopkLogitsPostProcessor:
         self.cp_size = cp_size
         self.k = k
         self.enable_seq_packing = enable_seq_packing
+        self.compute_teacher_entropy = compute_teacher_entropy
 
     def __call__(
         self,
@@ -820,7 +826,7 @@ class TopkLogitsPostProcessor:
         original_batch_size: int,
         original_seq_len: int,
         sequence_dim: int = 1,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Compute top-k logits and indices from model outputs.
 
         Args:
@@ -832,10 +838,11 @@ class TopkLogitsPostProcessor:
             sequence_dim: Sequence dimension
 
         Returns:
-            Tuple of (top-k values, top-k indices) tensors
+            Tuple of (top-k values, top-k indices, teacher_entropy) tensors
         """
         input_lengths = data_dict["input_lengths"]
 
+        teacher_entropy = None
         if self.cp_size > 1:
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
@@ -859,10 +866,18 @@ class TopkLogitsPostProcessor:
             )
             # [B, S_cp, k]
 
+            if self.compute_teacher_entropy:
+                chunk_size = local_logits.shape[1]
+                teacher_entropy = ChunkedDistributedEntropy.apply(
+                    local_logits.to(torch.float32), chunk_size, tp_group, True,
+                )  # [B, S_cp]
+
             cp_group = self.cp_mesh.get_group()
 
             vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
             idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
+            if teacher_entropy is not None:
+                teacher_entropy = allgather_cp_sharded_tensor(teacher_entropy, cp_group, seq_dim=sequence_dim)
             # [B, S, k]
         else:
             # Compute top-k over full sequence length
@@ -881,15 +896,22 @@ class TopkLogitsPostProcessor:
                     vocab_start_index=vocab_start_index,
                     vocab_end_index=vocab_end_index,
                 )
+
+                if self.compute_teacher_entropy:
+                    chunk_size = local_logits.shape[1]
+                    teacher_entropy = ChunkedDistributedEntropy.apply(
+                        local_logits.to(torch.float32), chunk_size, tp_group, True,
+                    )
             else:
                 full_logits = logits.to(torch.float32)
                 vals, idx = torch.topk(full_logits, k=self.k, dim=-1)
 
+                if self.compute_teacher_entropy:
+                    log_probs = torch.nn.functional.log_softmax(full_logits, dim=-1)
+                    teacher_entropy = (log_probs.exp() * log_probs).sum(dim=-1)
+
         # Handle sequence packing unpacking
         if self.enable_seq_packing:
-            # Unpack top-k results from packed format back to original batch format
-            # vals: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
-            # idx: [1, packed_seq_len, k] -> [original_batch_size, original_seq_len, k]
             unpacked_vals = torch.zeros(
                 (original_batch_size, original_seq_len, self.k),
                 dtype=vals.dtype,
@@ -900,6 +922,12 @@ class TopkLogitsPostProcessor:
                 dtype=idx.dtype,
                 device=idx.device,
             )
+            if teacher_entropy is not None:
+                unpacked_ent = torch.zeros(
+                    (original_batch_size, original_seq_len),
+                    dtype=teacher_entropy.dtype,
+                    device=teacher_entropy.device,
+                )
 
             cu_seqlens = processed_inputs.flash_attn_kwargs.cu_seqlens_q
 
@@ -908,15 +936,17 @@ class TopkLogitsPostProcessor:
                 end = cu_seqlens[i + 1].item()
                 seq_len_actual = input_lengths[i].item()
 
-                # Extract the corresponding portion from packed results
-                # Note: vals and idx are [1, packed_seq_len, k] due to packing
                 unpacked_vals[i, :seq_len_actual, :] = vals[0, start:end, :]
                 unpacked_idx[i, :seq_len_actual, :] = idx[0, start:end, :]
+                if teacher_entropy is not None:
+                    unpacked_ent[i, :seq_len_actual] = teacher_entropy[0, start:end]
 
             vals = unpacked_vals
             idx = unpacked_idx
+            if teacher_entropy is not None:
+                teacher_entropy = unpacked_ent
 
-        return vals, idx
+        return vals, idx, teacher_entropy
 
 
 class ScorePostProcessor:

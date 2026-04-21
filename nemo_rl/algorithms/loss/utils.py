@@ -104,7 +104,10 @@ def prepare_loss_input(
         loss_input = {"next_token_logprobs": logprobs}
 
     elif loss_fn.input_type == LossInputType.DISTILLATION:
-        calculate_entropy = loss_fn.zero_outside_topk and loss_fn.kl_type != "forward"
+        calculate_entropy = (
+            (loss_fn.zero_outside_topk and loss_fn.kl_type != "forward")
+            or loss_fn.egmd_enabled
+        )
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=logits,

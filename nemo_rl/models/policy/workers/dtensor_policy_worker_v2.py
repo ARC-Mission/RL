@@ -668,6 +668,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
         data: BatchedDataDict[Any],
         k: int,
         micro_batch_size: Optional[int] = None,
+        compute_teacher_entropy: bool = False,
     ) -> BatchedDataDict[Any]:
         """Return per-position top-k logits and corresponding global indices.
 
@@ -690,6 +691,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
         out_topk_vals = []
         out_topk_idx = []
+        out_topk_ent = []
         self.model.eval()
 
         # Create top-k post-processor
@@ -701,6 +703,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             cp_size=self.cp_size,
             k=k,
             enable_seq_packing=self.enable_seq_packing,
+            compute_teacher_entropy=compute_teacher_entropy,
         )
 
         with torch.no_grad():
@@ -727,7 +730,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                     autocast_enabled=self.autocast_enabled,
                 ):
                     # Use forward_with_post_processing_fn for forward pass and post-processing
-                    (vals, idx), _metrics, _ = forward_with_post_processing_fn(
+                    (vals, idx, ent), _metrics, _ = forward_with_post_processing_fn(
                         model=self.model,
                         post_processing_fn=topk_post_processor,
                         processed_mb=processed_mb,
@@ -745,13 +748,17 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
                 out_topk_idx.append(idx.cpu())
+                if ent is not None:
+                    out_topk_ent.append(ent.cpu())
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs
         all_topk_vals_padded = []
         all_topk_idx_padded = []
+        all_topk_ent_padded = []
+        has_entropy = len(out_topk_ent) > 0
         target_seq_len = seq_dim_size
-        for vals, idx in zip(out_topk_vals, out_topk_idx):
+        for mb_idx, (vals, idx) in enumerate(zip(out_topk_vals, out_topk_idx)):
             pad_needed = target_seq_len - vals.shape[1]
             if pad_needed > 0:
                 # pad along sequence dimension (second dim): (last_dim_pad_left, last_dim_pad_right, seq_pad_left, seq_pad_right, batch_pad_left, batch_pad_right)
@@ -763,6 +770,13 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
                 )
             all_topk_vals_padded.append(vals)
             all_topk_idx_padded.append(idx)
+            if has_entropy:
+                ent = out_topk_ent[mb_idx]
+                if pad_needed > 0:
+                    ent = torch.nn.functional.pad(
+                        ent, (0, pad_needed), mode="constant", value=0.0
+                    )
+                all_topk_ent_padded.append(ent)
 
         ret["topk_logits"] = (
             torch.cat(all_topk_vals_padded, dim=0)
@@ -774,6 +788,12 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
             if len(all_topk_idx_padded) > 1
             else all_topk_idx_padded[0]
         ).cpu()
+        if has_entropy:
+            ret["teacher_entropy"] = (
+                torch.cat(all_topk_ent_padded, dim=0)
+                if len(all_topk_ent_padded) > 1
+                else all_topk_ent_padded[0]
+            ).cpu()
         return ret
 
     @contextmanager

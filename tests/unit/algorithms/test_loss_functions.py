@@ -1996,3 +1996,168 @@ def test_distillation_loss_fn_call():
     expected_fields = ["loss"]
     for field in expected_fields:
         assert field in metrics
+
+
+def _make_egmd_test_data(batch_size=2, seq_len=6, k=4):
+    """Create test data with controlled entropy gap for EGMD tests."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    device = "cuda"
+    torch.manual_seed(42)
+
+    # Student log-probs: mix of high-entropy and low-entropy positions
+    student_topk_logprobs = torch.log_softmax(
+        torch.randn(batch_size, seq_len, k, device=device), dim=-1
+    )
+    # Teacher log-probs: confident everywhere (low entropy)
+    teacher_topk_logprobs = torch.log_softmax(
+        torch.randn(batch_size, seq_len, k, device=device) * 5.0, dim=-1
+    )
+
+    # H_all (student full-vocab entropy, stored as sum(p*logp) = -H, so negative)
+    H_all = (student_topk_logprobs.exp() * student_topk_logprobs).sum(-1)
+
+    # Teacher entropy: make teacher very confident (low entropy => H_teacher close to 0 => teacher_entropy close to 0)
+    teacher_entropy = (teacher_topk_logprobs.exp() * teacher_topk_logprobs).sum(-1)
+
+    token_mask = torch.ones(batch_size, seq_len + 1, device=device)
+    sample_mask = torch.ones(batch_size, device=device)
+    data = {
+        "input_ids": torch.zeros(batch_size, seq_len + 1, dtype=torch.long, device=device),
+        "input_lengths": torch.full((batch_size,), seq_len + 1, device=device),
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.zeros(batch_size, seq_len + 1, k, device=device),
+        "teacher_topk_indices": torch.zeros(batch_size, seq_len + 1, k, dtype=torch.long, device=device),
+        "teacher_entropy": torch.cat(
+            [torch.zeros(batch_size, 1, device=device), teacher_entropy], dim=1
+        ),
+    }
+    global_valid_seqs = sample_mask.sum()
+    global_valid_toks = (token_mask * sample_mask.unsqueeze(-1)).sum()
+    return student_topk_logprobs, teacher_topk_logprobs, H_all, data, global_valid_seqs, global_valid_toks
+
+
+def test_egmd_disabled_matches_standard_kl():
+    """EGMD disabled should produce identical loss to standard reverse KL."""
+    student_lp, teacher_lp, H_all, data, gvs, gvt = _make_egmd_test_data()
+
+    standard_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+    })
+    egmd_off_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+        "egmd_enabled": False, "egmd_beta": 5.0, "egmd_percentile_p": 0.6, "egmd_alpha": 0.0,
+    })
+
+    loss_std, _ = standard_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+    loss_off, _ = egmd_off_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+    torch.testing.assert_close(loss_std, loss_off)
+
+
+def test_egmd_v1_produces_weighted_kl():
+    """EGMD V1 (alpha=0) should produce different loss than standard KL when enabled."""
+    student_lp, teacher_lp, H_all, data, gvs, gvt = _make_egmd_test_data()
+
+    standard_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+    })
+    egmd_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+        "egmd_enabled": True, "egmd_beta": 5.0, "egmd_percentile_p": 0.6, "egmd_alpha": 0.0,
+    })
+
+    loss_std, _ = standard_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+    loss_egmd, metrics = egmd_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+
+    # Losses should differ since w(t) is not uniform
+    assert not torch.allclose(loss_std, loss_egmd), "EGMD should change the loss"
+
+    # Check diagnostics are present
+    assert "egmd/mean_w" in metrics
+    assert "egmd/tau" in metrics
+    assert "egmd/delta_mean" in metrics
+    assert "egmd/delta_std" in metrics
+    assert "egmd/H_student_mean" in metrics
+    assert "egmd/H_teacher_mean" in metrics
+    assert "egmd/frac_high_delta" in metrics
+    assert "egmd/frac_low_delta" in metrics
+
+    # mean_w should be between 0 and 1
+    assert 0.0 <= metrics["egmd/mean_w"] <= 1.0
+
+
+def test_egmd_v2_entropy_bonus():
+    """EGMD V2 (alpha>0) should differ from V1 (alpha=0)."""
+    student_lp, teacher_lp, H_all, data, gvs, gvt = _make_egmd_test_data()
+
+    v1_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+        "egmd_enabled": True, "egmd_beta": 5.0, "egmd_percentile_p": 0.6, "egmd_alpha": 0.0,
+    })
+    v2_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+        "egmd_enabled": True, "egmd_beta": 5.0, "egmd_percentile_p": 0.6, "egmd_alpha": 0.1,
+    })
+
+    loss_v1, _ = v1_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+    loss_v2, metrics_v2 = v2_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+
+    assert not torch.allclose(loss_v1, loss_v2), "Entropy bonus should change the loss"
+    assert "egmd/entropy_bonus_mean" in metrics_v2
+
+
+def test_egmd_gating_direction():
+    """High-delta positions should get low w, low-delta should get high w."""
+    if not torch.cuda.is_available():
+        pytest.skip("No GPU available")
+    device = "cuda"
+    B, S, k = 1, 4, 4
+
+    # Position 0-1: student uncertain, teacher confident (high delta => low w)
+    # Position 2-3: both similar entropy (low delta => high w)
+    student_lp = torch.log_softmax(torch.tensor([
+        [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0],  # uniform (high entropy)
+         [5.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0]],  # peaked (low entropy)
+    ], device=device), dim=-1)
+    teacher_lp = torch.log_softmax(torch.tensor([
+        [[5.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0],  # peaked (low entropy)
+         [5.0, 0.0, 0.0, 0.0], [5.0, 0.0, 0.0, 0.0]],  # peaked (low entropy)
+    ], device=device), dim=-1)
+
+    H_all = (student_lp.exp() * student_lp).sum(-1)
+    teacher_entropy_vals = (teacher_lp.exp() * teacher_lp).sum(-1)
+
+    data = {
+        "input_ids": torch.zeros(B, S + 1, dtype=torch.long, device=device),
+        "input_lengths": torch.full((B,), S + 1, device=device),
+        "token_mask": torch.ones(B, S + 1, device=device),
+        "sample_mask": torch.ones(B, device=device),
+        "teacher_topk_logits": torch.zeros(B, S + 1, k, device=device),
+        "teacher_topk_indices": torch.zeros(B, S + 1, k, dtype=torch.long, device=device),
+        "teacher_entropy": torch.cat(
+            [torch.zeros(B, 1, device=device), teacher_entropy_vals], dim=1
+        ),
+    }
+
+    egmd_fn = DistillationLossFn({
+        "kl_type": "reverse", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+        "egmd_enabled": True, "egmd_beta": 10.0, "egmd_percentile_p": 0.5, "egmd_alpha": 0.0,
+    })
+
+    gvs = data["sample_mask"].sum()
+    gvt = (data["token_mask"] * data["sample_mask"].unsqueeze(-1)).sum()
+    _, metrics = egmd_fn(student_lp, teacher_lp, H_all, data, gvs, gvt)
+
+    # With high beta and p=0.5, the gating should be fairly binary
+    assert metrics["egmd/mean_w"] > 0.0
+    assert metrics["egmd/mean_w"] < 1.0
+
+
+def test_egmd_forward_kl_rejected():
+    """EGMD should not be allowed with forward KL."""
+    with pytest.raises(AssertionError, match="EGMD is only supported"):
+        DistillationLossFn({
+            "kl_type": "forward", "mixed_kl_weight": 0.5, "zero_outside_topk": False,
+            "egmd_enabled": True, "egmd_beta": 5.0, "egmd_percentile_p": 0.6, "egmd_alpha": 0.0,
+        })
