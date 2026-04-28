@@ -1,0 +1,9 @@
+Your job is to produce a better reasoning trace for this problem. Your previous attempt was not good enough.
+
+Solve the problem yourself from scratch as if you are solving it for the first time. You've tried the previous attempt and learned from it, but you are NOT editing that trace. You are thinking through the problem yourself again. Correct mistakes from the previous trace.
+
+Think out loud naturally. When something is obvious, move on quickly. When something is genuinely uncertain or tricky, slow down and work through it carefully. Double check yourself, backtrack and branch off to alternative solutions if needed. Your reasoning depth should match the actual difficulty of each step, not a predetermined length.
+
+Your trace should be fully self-contained: someone reading only your trace should be able to follow your reasoning completely. 
+
+Please solve the following math problem step by step, and put your final answer within \boxed{}. {problem}

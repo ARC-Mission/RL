@@ -485,6 +485,27 @@ def _process_trace(trace: str, task_data_spec: TaskDataSpec) -> str:
     return trace
 
 
+def _get_teacher_refine_assistant_content(
+    static_answer: str,
+    task_data_spec: TaskDataSpec,
+) -> str:
+    """Select the static answer content to inject as teacher assistant context."""
+    mode = task_data_spec.teacher_refine_assistant_content_mode
+    if mode == "full":
+        return static_answer
+    if mode == "after_reasoning_if_present":
+        closing_tag = "</think>"
+        tag_idx = static_answer.lower().rfind(closing_tag)
+        if tag_idx < 0:
+            return static_answer
+        after_reasoning = static_answer[tag_idx + len(closing_tag) :].strip()
+        return after_reasoning or static_answer
+    raise ValueError(
+        "teacher_refine_assistant_content_mode must be one of "
+        f"['full', 'after_reasoning_if_present'], got {mode!r}"
+    )
+
+
 def math_hf_data_processor(
     datum_dict: dict[str, Any],
     task_data_spec: TaskDataSpec,
@@ -557,14 +578,21 @@ def math_hf_data_processor(
             msg["content"] = msg_str
             return [msg]
 
+        def _format_refine_chat_content(prompt_text: str) -> str:
+            content = prompt_text
+            for key, value in format_kwargs.items():
+                content = content.replace(f"{{{key}}}", str(value))
+            return content
+
         def _build_multiturn_teacher_ml(
             student_prompt_content: str,
             trace_text: str,
             refine_prompt_text: str,
+            system_prompt_text: str | None = None,
         ) -> list[dict[str, Any]]:
             """Build a multi-turn teacher message log.
 
-            Layout: [user(problem), assistant(<think>{trace}</think>), user(refine)].
+            Layout: [system(optional), user(problem), assistant(trace), user(refine)].
             The static dataset trace is *injected* as the assistant turn so the
             teacher sees it as if the model reasoned itself. The live student
             rollout is appended later by
@@ -576,17 +604,37 @@ def math_hf_data_processor(
             chat-template chunk that turn contributes — concatenating them yields
             the correct full conversation tokenization.
             """
-            stripped = trace_text.strip()
-            if stripped.startswith("<think>"):
-                trace_content = stripped
-            else:
-                trace_content = f"<think>\n{stripped}\n</think>"
+            trace_content = _get_teacher_refine_assistant_content(
+                trace_text, task_data_spec
+            )
+            if (
+                system_prompt_text is None
+                and task_data_spec.teacher_refine_assistant_content_mode == "full"
+            ):
+                stripped = trace_content.strip()
+                if not stripped.startswith("<think>"):
+                    trace_content = f"<think>\n{stripped}\n</think>"
+                else:
+                    trace_content = stripped
 
-            messages_raw: list[dict[str, str]] = [
-                {"role": "user", "content": student_prompt_content},
-                {"role": "assistant", "content": trace_content},
-                {"role": "user", "content": refine_prompt_text},
-            ]
+            messages_raw: list[dict[str, str]] = []
+            if system_prompt_text is not None:
+                messages_raw.append(
+                    {
+                        "role": "system",
+                        "content": _format_refine_chat_content(system_prompt_text),
+                    }
+                )
+            messages_raw.extend(
+                [
+                    {"role": "user", "content": student_prompt_content},
+                    {"role": "assistant", "content": trace_content},
+                    {
+                        "role": "user",
+                        "content": _format_refine_chat_content(refine_prompt_text),
+                    },
+                ]
+            )
 
             teacher_ml: list[dict[str, Any]] = []
             prev_formatted = ""
@@ -627,6 +675,7 @@ def math_hf_data_processor(
                 student_prompt_content=formatted_content,
                 trace_text=trace_text,
                 refine_prompt_text=task_data_spec.teacher_refine_prompt,
+                system_prompt_text=task_data_spec.teacher_refine_system_prompt,
             )
         elif task_data_spec.teacher_prompt is not None:
             teacher_message_log = _build_teacher_ml(task_data_spec.teacher_prompt)

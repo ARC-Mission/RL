@@ -1,0 +1,3 @@
+When solving the problem for the after trying once, treat your previous attempt way you would treat reading a classmate's rough work before attempting the problem yourself. It may contain useful ideas, dead ends, mistakes, or insights. Learn from it, correct its mistakes, then do your own thinking.
+
+You are solving the problem yourself from scratch and you should reason step-by-step.

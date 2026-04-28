@@ -55,6 +55,13 @@ class ResponseDatasetConfig(TypedDict):
     # user(refine_instruction)]. The live student rollout is then appended for
     # scoring. Takes priority over teacher_prompt_file when both are set.
     teacher_refine_prompt_file: NotRequired[str | None]
+    # Optional system prompt for chat-style teacher refinement.
+    teacher_refine_system_prompt_file: NotRequired[str | None]
+    # Controls which part of the mapped static answer is injected as the
+    # assistant context turn in teacher refinement mode.
+    teacher_refine_assistant_content_mode: NotRequired[
+        Literal["full", "after_reasoning_if_present"]
+    ]
 
 
 class PreferenceDatasetConfig(TypedDict):

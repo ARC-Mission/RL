@@ -191,6 +191,100 @@ def test_math_hf_data_processor_without_prompt():
     assert "Solve 1+1." in result["message_log"][0]["content"]
 
 
+def _chat_teacher_task_spec(
+    assistant_content_mode: str = "full",
+) -> TaskDataSpec:
+    task_spec = TaskDataSpec(
+        task_name="math",
+        prompt_file=None,
+        system_prompt_file=None,
+        teacher_refine_assistant_content_mode=assistant_content_mode,
+        column_mapping={"static_answer": "trace"},
+    )
+    task_spec.prompt = "Please solve step by step: {problem}"
+    task_spec.teacher_refine_system_prompt = "System guidance for {problem}"
+    task_spec.teacher_refine_prompt = "Rewrite the solution for {problem} in \\boxed{}"
+    return task_spec
+
+
+def test_math_hf_data_processor_chat_teacher_full_static_answer():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Find x."},
+            {"role": "assistant", "content": "x=1"},
+        ],
+        "static_answer": "<think>reasoning</think>\nThe answer is 1.",
+        "task_name": "math",
+    }
+
+    result = math_hf_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=_chat_teacher_task_spec(),
+        tokenizer=DummyTokenizer(),
+        max_seq_length=512,
+        idx=0,
+    )
+
+    teacher_message_log = result["teacher_message_log"]
+    assert [msg["role"] for msg in teacher_message_log] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+
+    rendered_teacher_chat = "".join(msg["content"] for msg in teacher_message_log)
+    assert "system: System guidance for Find x.\n" in rendered_teacher_chat
+    assert "user: Please solve step by step: Find x.\n" in rendered_teacher_chat
+    assert (
+        "assistant: <think>reasoning</think>\nThe answer is 1.\n"
+        in rendered_teacher_chat
+    )
+    assert (
+        "user: Rewrite the solution for Find x. in \\boxed{}\nassistant:"
+        in rendered_teacher_chat
+    )
+
+
+def test_math_hf_data_processor_chat_teacher_after_reasoning_mode():
+    base_datum = {
+        "messages": [
+            {"role": "user", "content": "Find y."},
+            {"role": "assistant", "content": "y=2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    extracted_result = math_hf_data_processor(
+        datum_dict={
+            **base_datum,
+            "static_answer": "<think>hidden reasoning</think>\nThe answer is 2.",
+        },
+        task_data_spec=_chat_teacher_task_spec("after_reasoning_if_present"),
+        tokenizer=tokenizer,
+        max_seq_length=512,
+        idx=0,
+    )
+    extracted_chat = "".join(
+        msg["content"] for msg in extracted_result["teacher_message_log"]
+    )
+    assert "assistant: The answer is 2.\n" in extracted_chat
+    assert "hidden reasoning" not in extracted_chat
+
+    fallback_result = math_hf_data_processor(
+        datum_dict={**base_datum, "static_answer": "<think>only reasoning</think>   "},
+        task_data_spec=_chat_teacher_task_spec("after_reasoning_if_present"),
+        tokenizer=tokenizer,
+        max_seq_length=512,
+        idx=0,
+    )
+    fallback_chat = "".join(
+        msg["content"] for msg in fallback_result["teacher_message_log"]
+    )
+    assert "assistant: <think>only reasoning</think>   \n" in fallback_chat
+
+
 @pytest.fixture
 def system_prompt_file(request):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
