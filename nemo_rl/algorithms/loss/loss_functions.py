@@ -983,6 +983,8 @@ class DistillationLossFn(LossFunction):
         # EGMD: entropy-gap modulated distillation
         egmd_metrics: dict[str, Any] = {}
         if self.egmd_enabled:
+            if self.egmd_alpha == 0 and H_all is not None:
+                H_all = H_all.detach()
             teacher_entropy = data["teacher_entropy"][:, 1:][:, :max_len]
             # delta = H_student - H_teacher (spec convention)
             # H_all = sum(p*logp) = -H_student, teacher_entropy = -H_teacher

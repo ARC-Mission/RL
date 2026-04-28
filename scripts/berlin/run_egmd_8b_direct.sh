@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=egmd-8b
+#SBATCH --job-name=egmd-8b-direct
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
@@ -71,11 +71,11 @@ mkdir -p "$JOB_CACHE_ROOT" \
 
 # ── Output directories ──────────────────────────────────────────────────────
 mkdir -p /fast/project/HFMI_SynergyUnit/yll/logs/slurm
-mkdir -p /fast/project/HFMI_SynergyUnit/yll/logs/egmd-8b-rewrite
-mkdir -p /fast/project/HFMI_SynergyUnit/yll/checkpoints/egmd-8b-rewrite
+mkdir -p /fast/project/HFMI_SynergyUnit/yll/logs/egmd-8b-rewrite-direct
+mkdir -p /fast/project/HFMI_SynergyUnit/yll/checkpoints/egmd-8b-rewrite-direct
 
 # ── Launch ──────────────────────────────────────────────────────────────────
-CONFIG="examples/configs/opsd/berlin/egmd-8b-1n8g-rewrite.yaml"
+CONFIG="examples/configs/opsd/berlin/egmd-8b-1n8g-rewrite-direct.yaml"
 QWEN3_TP_PLAN="examples.custom_parallel.custom_parallel.qwen_model_tp_plan_stable"
 
 uv run python examples/run_distillation.py \

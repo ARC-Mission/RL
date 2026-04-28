@@ -1546,7 +1546,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                         vocab_start_index = tp_rank * V_local
                         vocab_end_index = (tp_rank + 1) * V_local
 
-                        vals, idx = distributed_vocab_topk(
+                        vals, idx, _ = distributed_vocab_topk(
                             local_logits,
                             k=k,
                             tp_group=tp_group,
@@ -1574,7 +1574,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                             vocab_start_index = tp_rank * V_local
                             vocab_end_index = (tp_rank + 1) * V_local
 
-                            vals, idx = distributed_vocab_topk(
+                            vals, idx, _ = distributed_vocab_topk(
                                 local_logits,
                                 k=k,
                                 tp_group=tp_group,

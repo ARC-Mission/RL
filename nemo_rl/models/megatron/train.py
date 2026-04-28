@@ -44,7 +44,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     from_parallel_logits_to_logprobs,
@@ -516,24 +515,15 @@ class TopkLogitsPostProcessor:
             if "logprob_chunk_size" in self.cfg:
                 chunk_size = self.cfg["logprob_chunk_size"]
 
-            topk_vals_local, topk_idx_local = distributed_vocab_topk(
+            topk_vals_local, topk_idx_local, teacher_entropy_local = distributed_vocab_topk(
                 output_tensor,
                 self.k,
                 tp_grp,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_start_index + vocab_shard_size,
                 chunk_size=chunk_size,
+                compute_entropy=self.compute_teacher_entropy,
             )
-
-            teacher_entropy_local = None
-            if self.compute_teacher_entropy:
-                entropy_chunk_size = chunk_size if chunk_size is not None else output_tensor.shape[1]
-                teacher_entropy_local = ChunkedDistributedEntropy.apply(
-                    output_tensor.to(torch.float32),
-                    entropy_chunk_size,
-                    tp_grp,
-                    True,  # inference_only
-                )  # [B, S]
 
             if self.cfg["megatron_cfg"]["context_parallel_size"] > 1:
                 cp_grp = get_context_parallel_group()

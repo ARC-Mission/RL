@@ -42,7 +42,6 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.utils import mask_out_neg_inf_logprobs
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import (
-    ChunkedDistributedEntropy,
     allgather_cp_sharded_tensor,
     distributed_vocab_topk,
     get_logprobs_from_vocab_parallel_logits,
@@ -299,6 +298,8 @@ def forward_with_post_processing_fn(
     processed_inputs = processed_mb.processed_inputs
 
     # Model forward pass
+    _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    print(f"[rank={_rank}] forward pass start", flush=True)
     outputs = model_forward(
         model,
         processed_inputs,
@@ -309,6 +310,7 @@ def forward_with_post_processing_fn(
     # Extract logits from model outputs
     logits = extract_logits(model, outputs)
     del outputs
+    print(f"[rank={_rank}] forward pass done, logits shape={logits.shape}", flush=True)
 
     # Apply temperature scaling only for sampling-oriented post-processors
     # Score computations should use unscaled logits
@@ -457,6 +459,8 @@ def automodel_forward_backward(
                     ## value when summing metrics across all microbatches
                     for k in metrics.keys():
                         if "_min" in k or "_max" in k:
+                            continue
+                        if k.startswith("_hist/") or isinstance(metrics[k], list):
                             continue
 
                         metrics[k] /= num_global_batches
@@ -843,7 +847,9 @@ class TopkLogitsPostProcessor:
         input_lengths = data_dict["input_lengths"]
 
         teacher_entropy = None
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
         if self.cp_size > 1:
+            print(f"[rank={_rank}] topk_postproc: CP>1, redistributing logits", flush=True)
             logits = redistribute_logits_for_cp(
                 logits, self.device_mesh, self.cp_mesh, sequence_dim
             )
@@ -857,27 +863,26 @@ class TopkLogitsPostProcessor:
             vocab_start_index = tp_rank * V_local
             vocab_end_index = (tp_rank + 1) * V_local
 
-            vals, idx = distributed_vocab_topk(
+            print(f"[rank={_rank}] topk_postproc: calling distributed_vocab_topk, shape={local_logits.shape}, compute_entropy={self.compute_teacher_entropy}", flush=True)
+            vals, idx, teacher_entropy = distributed_vocab_topk(
                 local_logits,
                 k=self.k,
                 tp_group=tp_group,
                 vocab_start_index=vocab_start_index,
                 vocab_end_index=vocab_end_index,
+                compute_entropy=self.compute_teacher_entropy,
             )
+            print(f"[rank={_rank}] topk_postproc: distributed_vocab_topk done", flush=True)
             # [B, S_cp, k]
-
-            if self.compute_teacher_entropy:
-                chunk_size = local_logits.shape[1]
-                teacher_entropy = ChunkedDistributedEntropy.apply(
-                    local_logits.to(torch.float32), chunk_size, tp_group, True,
-                )  # [B, S_cp]
 
             cp_group = self.cp_mesh.get_group()
 
+            print(f"[rank={_rank}] topk_postproc: CP allgather start", flush=True)
             vals = allgather_cp_sharded_tensor(vals, cp_group, seq_dim=sequence_dim)
             idx = allgather_cp_sharded_tensor(idx, cp_group, seq_dim=sequence_dim)
             if teacher_entropy is not None:
                 teacher_entropy = allgather_cp_sharded_tensor(teacher_entropy, cp_group, seq_dim=sequence_dim)
+            print(f"[rank={_rank}] topk_postproc: CP allgather done", flush=True)
             # [B, S, k]
         else:
             # Compute top-k over full sequence length
@@ -889,19 +894,14 @@ class TopkLogitsPostProcessor:
                 vocab_start_index = tp_rank * V_local
                 vocab_end_index = (tp_rank + 1) * V_local
 
-                vals, idx = distributed_vocab_topk(
+                vals, idx, teacher_entropy = distributed_vocab_topk(
                     local_logits,
                     k=self.k,
                     tp_group=tp_group,
                     vocab_start_index=vocab_start_index,
                     vocab_end_index=vocab_end_index,
+                    compute_entropy=self.compute_teacher_entropy,
                 )
-
-                if self.compute_teacher_entropy:
-                    chunk_size = local_logits.shape[1]
-                    teacher_entropy = ChunkedDistributedEntropy.apply(
-                        local_logits.to(torch.float32), chunk_size, tp_group, True,
-                    )
             else:
                 full_logits = logits.to(torch.float32)
                 vals, idx = torch.topk(full_logits, k=self.k, dim=-1)

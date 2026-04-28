@@ -108,6 +108,10 @@ def prepare_loss_input(
             (loss_fn.zero_outside_topk and loss_fn.kl_type != "forward")
             or loss_fn.egmd_enabled
         )
+        entropy_requires_grad = (
+            (loss_fn.zero_outside_topk and loss_fn.kl_type != "forward")
+            or (loss_fn.egmd_enabled and loss_fn.egmd_alpha > 0)
+        )
         student_topk_logprobs, teacher_topk_logprobs, H_all = (
             get_distillation_topk_logprobs_from_logits(
                 student_logits=logits,
@@ -115,6 +119,7 @@ def prepare_loss_input(
                 teacher_topk_indices=data["teacher_topk_indices"],
                 zero_outside_topk=loss_fn.zero_outside_topk,
                 calculate_entropy=calculate_entropy,
+                entropy_requires_grad=entropy_requires_grad,
                 vocab_parallel_rank=vocab_parallel_rank,
                 vocab_parallel_group=vocab_parallel_group,
                 context_parallel_group=context_parallel_group,

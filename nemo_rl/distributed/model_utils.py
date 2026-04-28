@@ -1339,7 +1339,8 @@ def distributed_vocab_topk(
     vocab_start_index: int,
     vocab_end_index: int,
     chunk_size: Optional[int] = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    compute_entropy: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Compute global top-k over TP-sharded vocabulary logits.
 
     Args:
@@ -1349,10 +1350,12 @@ def distributed_vocab_topk(
         vocab_start_index: global vocab start for this rank (inclusive)
         vocab_end_index: global vocab end for this rank (exclusive)
         chunk_size: optional chunk along sequence dim to bound memory
+        compute_entropy: if True, also compute per-token entropy (fused with the topk pass)
 
     Returns:
         topk_vals: [B, S, k]
         topk_global_indices: [B, S, k] (global token ids)
+        entropy: [B, S] if compute_entropy else None
     """
     assert vocab_end_index > vocab_start_index
     world_size = torch.distributed.get_world_size(tp_group)
@@ -1367,20 +1370,29 @@ def distributed_vocab_topk(
 
     vals_chunks: list[torch.Tensor] = []
     idx_chunks: list[torch.Tensor] = []
+    ent_chunks: list[torch.Tensor] = []
+
+    _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    num_chunks = (S + chunk_size - 1) // chunk_size
+    print(f"[rank={_rank}] distributed_vocab_topk: S={S}, chunk_size={chunk_size}, num_chunks={num_chunks}, compute_entropy={compute_entropy}", flush=True)
 
     for s0 in range(0, S, chunk_size):
         s1 = min(S, s0 + chunk_size)
+        chunk_logits = logits[:, s0:s1, :]
+
         # local top-k on this TP rank
         local_vals, local_idx_local = torch.topk(
-            logits[:, s0:s1, :], min(k, V_local), dim=-1
+            chunk_logits, min(k, V_local), dim=-1
         )
         local_idx_global = local_idx_local + int(vocab_start_index)
 
         # gather candidates from all TP ranks
         gathered_vals = [torch.empty_like(local_vals) for _ in range(world_size)]
         gathered_idx = [torch.empty_like(local_idx_global) for _ in range(world_size)]
+        print(f"[rank={_rank}] distributed_vocab_topk: chunk {s0}:{s1} all_gather start", flush=True)
         torch.distributed.all_gather(gathered_vals, local_vals, group=tp_group)
         torch.distributed.all_gather(gathered_idx, local_idx_global, group=tp_group)
+        print(f"[rank={_rank}] distributed_vocab_topk: chunk {s0}:{s1} all_gather done", flush=True)
 
         all_vals = torch.cat(gathered_vals, dim=-1)
         all_idx = torch.cat(gathered_idx, dim=-1)
@@ -1391,14 +1403,29 @@ def distributed_vocab_topk(
         vals_chunks.append(sel_vals)
         idx_chunks.append(sel_idx)
 
+        if compute_entropy:
+            print(f"[rank={_rank}] distributed_vocab_topk: chunk {s0}:{s1} entropy start", flush=True)
+            log_probs = _compute_distributed_log_softmax(chunk_logits, group=tp_group)
+            H_local = (log_probs.exp() * log_probs).sum(dim=-1)
+            torch.distributed.all_reduce(
+                H_local, op=torch.distributed.ReduceOp.SUM, group=tp_group
+            )
+            ent_chunks.append(H_local)
+            print(f"[rank={_rank}] distributed_vocab_topk: chunk {s0}:{s1} entropy done", flush=True)
+
     topk_vals = (
         torch.cat(vals_chunks, dim=1) if len(vals_chunks) > 1 else vals_chunks[0]
     )
     topk_global_indices = (
         torch.cat(idx_chunks, dim=1) if len(idx_chunks) > 1 else idx_chunks[0]
     )
+    entropy = None
+    if compute_entropy:
+        entropy = (
+            torch.cat(ent_chunks, dim=1) if len(ent_chunks) > 1 else ent_chunks[0]
+        )
 
-    return topk_vals, topk_global_indices
+    return topk_vals, topk_global_indices, entropy
 
 
 def gather_logits_at_global_indices(
@@ -1494,6 +1521,7 @@ def get_distillation_topk_logprobs_from_logits(
     teacher_topk_indices: torch.Tensor,
     zero_outside_topk: bool,
     calculate_entropy: bool,
+    entropy_requires_grad: bool = True,
     vocab_parallel_rank: Optional[int] = None,
     vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
@@ -1589,7 +1617,7 @@ def get_distillation_topk_logprobs_from_logits(
                     student_logits,
                     chunk_size,
                     parallel_group,
-                    False,
+                    not entropy_requires_grad,
                 )
 
             if cp_size > 1:
@@ -1636,7 +1664,7 @@ def get_distillation_topk_logprobs_from_logits(
                     student_logits,
                     chunk_size,
                     parallel_group if parallel_group is not None else cp_group,
-                    False,
+                    not entropy_requires_grad,
                 )
 
                 if cp_size > 1:
@@ -1649,8 +1677,13 @@ def get_distillation_topk_logprobs_from_logits(
             )
 
             if calculate_entropy:
-                student_logprobs_full = torch.nn.functional.log_softmax(student_logits, dim=-1)
-                H_all = (student_logprobs_full.exp() * student_logprobs_full).sum(-1)
+                if entropy_requires_grad:
+                    student_logprobs_full = torch.nn.functional.log_softmax(student_logits, dim=-1)
+                    H_all = (student_logprobs_full.exp() * student_logprobs_full).sum(-1)
+                else:
+                    with torch.no_grad():
+                        student_logprobs_full = torch.nn.functional.log_softmax(student_logits, dim=-1)
+                        H_all = (student_logprobs_full.exp() * student_logprobs_full).sum(-1)
 
         student_topk_logprobs = torch.nn.functional.log_softmax(
             student_topk_logits, dim=-1

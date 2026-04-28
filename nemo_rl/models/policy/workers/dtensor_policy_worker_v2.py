@@ -720,6 +720,7 @@ class DTensorPolicyWorkerV2Impl(AbstractPolicyWorker, ColocatablePolicyInterface
 
             for batch_idx, processed_mb in enumerate(processed_iterator):
                 processed_inputs = processed_mb.processed_inputs
+                print(f"[rank={self.rank}] topk mb {batch_idx}/{iterator_len} start", flush=True)
 
                 with get_train_context(
                     cp_size=self.cp_size,
