@@ -2,55 +2,78 @@
 #SBATCH --job-name=ray_distillation
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:4
+#SBATCH --mem=500G
 #SBATCH --time=24:00:00
 #SBATCH --partition=standard
+#SBATCH --qos=low
 #SBATCH --account=hfmi_synergyunit
 #SBATCH --output=/fast/project/HFMI_SynergyUnit/yll/RL/scripts/logs/%j-%x.out
 
-# Berlin Ray launcher for NeMo-RL.
+# Berlin bare-metal Ray launcher for NeMo-RL.
 #
 # Usage:
-#   COMMAND="uv run python examples/run_distillation.py ..." sbatch ray.sub
+#   COMMAND="uv run python examples/run_distillation.py ..." \
+#     GPUS_PER_NODE=4 sbatch scripts/berlin/ray.sub
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-NEMO_DIR="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-VENV="${VENV:-$NEMO_DIR/.venv}"
-RAY_BIN="${RAY_BIN:-$VENV/bin/ray}"
+if [[ -n "${NEMO_DIR:-}" ]]; then
+  REPO_ROOT="$NEMO_DIR"
+elif REPO_ROOT="$(git -C "${SLURM_SUBMIT_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null)"; then
+  :
+else
+  echo "[ERROR] Could not determine repository root."
+  echo "        Submit from inside the repo or set NEMO_DIR=/abs/path/to/RL."
+  exit 1
+fi
+cd "$REPO_ROOT"
 
-GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
-CPUS_PER_WORKER="${CPUS_PER_WORKER:-$SLURM_CPUS_PER_TASK}"
-LOG_DIR="$NEMO_DIR/scripts/logs/${SLURM_JOB_ID}-ray"
+VENV="${UV_PROJECT_ENVIRONMENT:-$REPO_ROOT/.venv}"
+export UV_PROJECT_ENVIRONMENT="$VENV"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV="${RAY_ENABLE_UV_RUN_RUNTIME_ENV:-0}"
 
-mkdir -p "$LOG_DIR"
-
-if [[ ! -x "$RAY_BIN" ]]; then
-  echo "ERROR: ray binary not found at $RAY_BIN"
-  echo "Install the project environment first, or set RAY_BIN explicitly."
+if [[ -x "$VENV/bin/ray" ]]; then
+  RAY_BIN="$VENV/bin/ray"
+elif command -v ray >/dev/null 2>&1; then
+  RAY_BIN="$(command -v ray)"
+else
+  echo "[ERROR] ray binary not found in $VENV/bin/ray and not on PATH."
   exit 1
 fi
 
-cd "$NEMO_DIR"
+if [[ -x "$VENV/bin/python" ]]; then
+  PY_BIN="$VENV/bin/python"
+elif command -v python >/dev/null 2>&1; then
+  PY_BIN="$(command -v python)"
+elif command -v python3 >/dev/null 2>&1; then
+  PY_BIN="$(command -v python3)"
+else
+  echo "[ERROR] python interpreter not found in venv or PATH."
+  exit 1
+fi
+
+LOG_DIR="${LOG_DIR:-$REPO_ROOT/scripts/logs/${SLURM_JOB_ID}-ray}"
+mkdir -p "$LOG_DIR"
+
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+CPUS_PER_WORKER="${CPUS_PER_WORKER:-${SLURM_CPUS_PER_TASK:-16}}"
+RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
+RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
 
 module purge
 module load GCC/13.3.0
 module load CUDA/12.6.0
 module load git
 
-export HF_HOME="${HF_HOME:-/fast/project/HFMI_SynergyUnit/yll/.cache/huggingface}"
-export TORCH_CUDA_ARCH_LIST="${TORCH_CUDA_ARCH_LIST:-9.0}"
-export NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-true}"
-export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$VENV}"
-export RAY_ENABLE_UV_RUN_RUNTIME_ENV="${RAY_ENABLE_UV_RUN_RUNTIME_ENV:-0}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
-export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
-export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
-export VLLM_DO_NOT_TRACK="${VLLM_DO_NOT_TRACK:-1}"
+# GCC module can set OMP_PROC_BIND=true, which crashes Ray's RuntimeEnvAgent.
+unset OMP_PROC_BIND OMP_PLACES
 
-JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-/fast/project/HFMI_SynergyUnit/yll/.cache/jobs/$SLURM_JOB_ID}"
+export REPO_CACHE_ROOT="${REPO_CACHE_ROOT:-/fast/project/HFMI_SynergyUnit/yll/.cache}"
+export JOB_CACHE_ROOT="${JOB_CACHE_ROOT:-$REPO_CACHE_ROOT/jobs/$SLURM_JOB_ID}"
+export HF_HOME="${HF_HOME:-$REPO_CACHE_ROOT/huggingface}"
+export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$JOB_CACHE_ROOT/xdg-cache}"
 export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$JOB_CACHE_ROOT/xdg-config}"
 export NEMO_RL_VLLM_CACHE_BASE="${NEMO_RL_VLLM_CACHE_BASE:-$JOB_CACHE_ROOT/vllm}"
@@ -59,8 +82,31 @@ export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$JOB_CACHE_ROOT/torch
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$JOB_CACHE_ROOT/triton}"
 export FLASHINFER_CACHE_DIR="${FLASHINFER_CACHE_DIR:-$JOB_CACHE_ROOT/flashinfer}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$JOB_CACHE_ROOT/torch_extensions}"
+export VLLM_NO_USAGE_STATS="${VLLM_NO_USAGE_STATS:-1}"
+export VLLM_DO_NOT_TRACK="${VLLM_DO_NOT_TRACK:-1}"
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/${USER}/ray-${SLURM_JOB_ID}}"
+export RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-$((150 * 1024 * 1024 * 1024))}"
+export RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE="${RAY_OBJECT_STORE_ALLOW_SLOW_STORAGE:-1}"
+export RAY_OVERRIDE_RESOURCES="{\"CPU\": $CPUS_PER_WORKER, \"GPU\": $GPUS_PER_NODE}"
+
+if [[ -z "${TORCH_CUDA_ARCH_LIST:-}" ]]; then
+  DETECTED_ARCH="$("$PY_BIN" - <<'PY' 2>/dev/null || true
+import torch
+if torch.cuda.is_available():
+    major, minor = torch.cuda.get_device_capability(0)
+    print(f"{major}.{minor}")
+PY
+)"
+  if [[ -n "$DETECTED_ARCH" ]]; then
+    export TORCH_CUDA_ARCH_LIST="$DETECTED_ARCH"
+  else
+    export TORCH_CUDA_ARCH_LIST="9.0"
+  fi
+fi
+echo "[INFO] TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST"
 
 mkdir -p \
+  "$RAY_TMPDIR" \
   "$HF_HOME" \
   "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" \
   "$NEMO_RL_VLLM_CACHE_BASE" "$NEMO_RL_VLLM_CONFIG_BASE" \
@@ -71,11 +117,9 @@ if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
   ulimit -Sn 65535
 fi
 
-RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
-RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
-
 nodes=($(scontrol show hostnames "$SLURM_JOB_NODELIST"))
 head_node="${nodes[0]}"
+head_addr=""
 declare -a SRUN_PIDS=()
 TERMINATION_SIGNAL=""
 DRIVER_RC=""
@@ -104,10 +148,9 @@ trap 'TERMINATION_SIGNAL="SIGTERM"; exit 143' TERM
 
 get_node_ip() {
   local node="$1"
-  local iface="${NETWORK_IFACE:-}"
-  if [[ -n "$iface" ]]; then
+  if [[ -n "${NETWORK_IFACE:-}" ]]; then
     srun --overlap -N1 -n1 -w "$node" \
-      bash -lc "ip -4 -o addr show dev '$iface' | awk '{split(\$4, a, \"/\"); print a[1]; exit}'" \
+      bash -lc "ip -4 -o addr show dev '$NETWORK_IFACE' | awk '{split(\$4, a, \"/\"); print a[1]; exit}'" \
       2>/dev/null || true
   else
     srun --overlap -N1 -n1 -w "$node" \
@@ -116,15 +159,6 @@ get_node_ip() {
   fi
 }
 
-echo "[INFO] Head node: $head_node"
-echo "[INFO] All nodes: ${nodes[*]}"
-
-head_ip="$(get_node_ip "$head_node")"
-if [[ -z "$head_ip" ]]; then
-  echo "[ERROR] Could not resolve an IPv4 address for $head_node"
-  exit 1
-fi
-
 if [[ -n "${NETWORK_IFACE:-}" ]]; then
   export GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-$NETWORK_IFACE}"
   export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-$NETWORK_IFACE}"
@@ -132,43 +166,47 @@ fi
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
-declare -a worker_nodes=()
+echo "[INFO] Job $SLURM_JOB_ID: ${#nodes[@]} node(s): ${nodes[*]}"
+echo "[INFO] GPUs/node: $GPUS_PER_NODE  CPUs/worker: $CPUS_PER_WORKER"
+
 declare -A NODE_IPS=()
-NODE_IPS["$head_node"]="$head_ip"
-for ((i = 1; i < ${#nodes[@]}; i++)); do
-  worker_nodes+=("${nodes[$i]}")
-  worker_ip="$(get_node_ip "${nodes[$i]}")"
-  if [[ -z "$worker_ip" ]]; then
-    echo "[ERROR] Could not resolve an IPv4 address for ${nodes[$i]}"
+for node in "${nodes[@]}"; do
+  ip="$(get_node_ip "$node")"
+  if [[ -z "$ip" ]]; then
+    echo "[ERROR] Could not resolve IPv4 for $node"
     exit 1
   fi
-  NODE_IPS["${nodes[$i]}"]="$worker_ip"
+  NODE_IPS["$node"]="$ip"
+  echo "[INFO] $node -> $ip"
 done
 
-echo "[INFO] Head IP: $head_ip"
-for node in "${worker_nodes[@]:-}"; do
-  echo "[INFO] Worker: $node -> ${NODE_IPS[$node]}"
+for node in "${nodes[@]}"; do
+  srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
 done
 
-echo "[INFO] Starting Ray head on $head_node"
+head_ip="${NODE_IPS[$head_node]}"
+head_addr="${head_ip}:$RAY_PORT"
+
+echo "[INFO] Starting Ray head on $head_node ($head_ip)"
 srun --overlap -N1 -n1 -w "$head_node" -o "$LOG_DIR/ray-head.log" \
   "$RAY_BIN" start --head \
+  --temp-dir="$RAY_TMPDIR" \
   --node-ip-address="$head_ip" \
   --port="$RAY_PORT" \
   --dashboard-port="$RAY_DASHBOARD_PORT" \
   --dashboard-host="$head_ip" \
   --num-cpus="$CPUS_PER_WORKER" \
   --num-gpus="$GPUS_PER_NODE" \
+  --object-store-memory="$RAY_OBJECT_STORE_MEMORY" \
   --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
   --disable-usage-stats \
   --block &
 SRUN_PIDS+=($!)
 
-head_addr="${head_ip}:$RAY_PORT"
 echo "[INFO] Waiting for Ray head at $head_addr..."
 for attempt in $(seq 1 30); do
   if ! kill -0 "${SRUN_PIDS[0]}" >/dev/null 2>&1; then
-    echo "[ERROR] Ray head step exited unexpectedly. Check $LOG_DIR/ray-head.log"
+    echo "[ERROR] Ray head exited unexpectedly. Check $LOG_DIR/ray-head.log"
     exit 1
   fi
   if srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" >/dev/null 2>&1; then
@@ -176,7 +214,7 @@ for attempt in $(seq 1 30); do
     break
   fi
   if [[ "$attempt" -eq 30 ]]; then
-    echo "[ERROR] Timed out waiting for Ray head"
+    echo "[ERROR] Timed out waiting for Ray head at $head_addr"
     exit 1
   fi
   sleep 2
@@ -188,10 +226,12 @@ for ((i = 1; i < ${#nodes[@]}; i++)); do
   echo "[INFO] Starting Ray worker on $worker ($worker_ip)"
   srun --overlap -N1 -n1 -w "$worker" -o "$LOG_DIR/ray-worker-$i.log" \
     "$RAY_BIN" start \
+    --temp-dir="$RAY_TMPDIR" \
     --address "$head_addr" \
     --node-ip-address="$worker_ip" \
     --num-cpus="$CPUS_PER_WORKER" \
     --num-gpus="$GPUS_PER_NODE" \
+    --object-store-memory="$RAY_OBJECT_STORE_MEMORY" \
     --resources="{\"worker_units\": $GPUS_PER_NODE, \"slurm_managed_ray_cluster\": 1}" \
     --disable-usage-stats \
     --block &
@@ -199,26 +239,29 @@ for ((i = 1; i < ${#nodes[@]}; i++)); do
   sleep 2
 done
 
+extract_worker_units() {
+  local status_output
+  status_output="$(srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" 2>&1 || true)"
+  printf '%s\n' "$status_output" >> "$LOG_DIR/ray-status.log"
+  awk '
+    /worker_units/ {
+      if (match($0, /[0-9]+(\.[0-9]+)?\/[0-9]+(\.[0-9]+)?/)) {
+        split(substr($0, RSTART, RLENGTH), a, "/");
+        print int(a[2] + 0);
+        found = 1;
+        exit
+      }
+    }
+    END { if (!found) print 0 }' <<< "$status_output"
+}
+
 EXPECTED_WORKER_UNITS=$((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))
 echo "[INFO] Waiting for worker_units=$EXPECTED_WORKER_UNITS..."
 for attempt in $(seq 1 60); do
-  status_output="$(srun --overlap -N1 -n1 -w "$head_node" "$RAY_BIN" status --address "$head_addr" 2>&1 || true)"
-  printf '%s\n' "$status_output" >> "$LOG_DIR/ray-status.log"
-  active="$(
-    awk '
-      /worker_units/ {
-        if (match($0, /[0-9]+(\.[0-9]+)?\/[0-9]+(\.[0-9]+)?/)) {
-          split(substr($0, RSTART, RLENGTH), a, "/");
-          print int(a[2] + 0);
-          found = 1;
-          exit
-        }
-      }
-      END { if (!found) print 0 }' <<< "$status_output"
-  )"
-  echo "[INFO] [$attempt/60] worker_units: $active/$EXPECTED_WORKER_UNITS"
-  if [[ "$active" -eq "$EXPECTED_WORKER_UNITS" ]]; then
-    echo "[INFO] All Ray workers connected"
+  ACTIVE="$(extract_worker_units)"
+  echo "[INFO] [$attempt/60] worker_units: $ACTIVE/$EXPECTED_WORKER_UNITS"
+  if [[ "$ACTIVE" -eq "$EXPECTED_WORKER_UNITS" ]]; then
+    echo "[INFO] All workers connected"
     break
   fi
   if [[ "$attempt" -eq 60 ]]; then
@@ -232,10 +275,12 @@ COMMAND="${COMMAND:-}"
 if [[ -n "$COMMAND" ]]; then
   echo "[INFO] Running: $COMMAND"
   set +e
+  cd "$REPO_ROOT"
   eval "$COMMAND" > "$LOG_DIR/ray-driver.log" 2>&1
   DRIVER_RC=$?
   set -e
-  echo "=== Driver log: $LOG_DIR/ray-driver.log ==="
+  echo "=== Driver log (last 100 lines) ==="
+  tail -100 "$LOG_DIR/ray-driver.log" 2>/dev/null || true
   if [[ "$DRIVER_RC" -ne 0 ]]; then
     echo "[ERROR] Driver failed with exit code $DRIVER_RC"
   fi
@@ -243,4 +288,5 @@ if [[ -n "$COMMAND" ]]; then
 fi
 
 echo "[INFO] No COMMAND specified. Ray cluster is idle."
+echo "[INFO] Attach: srun --overlap --jobid $SLURM_JOB_ID -N1 -n1 -w $head_node --pty bash"
 sleep infinity

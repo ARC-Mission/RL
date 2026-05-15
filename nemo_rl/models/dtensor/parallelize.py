@@ -28,7 +28,7 @@ from torch.distributed.fsdp import (
     OffloadPolicy,
     fully_shard,
 )
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, distribute_module, distribute_tensor
 from torch.distributed.tensor.parallel import (
     ColwiseParallel,
     ParallelStyle,
@@ -64,6 +64,7 @@ from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
     Qwen2VLForConditionalGeneration,
 )
+from transformers.models.olmo3.modeling_olmo3 import Olmo3ForCausalLM
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMForConditionalGeneration
 
@@ -265,12 +266,107 @@ def _parallelize_qwen(
     return cast(dict[str, ParallelStyle], base_model_tp_plan)
 
 
+class _ShardNormWeight(ParallelStyle):
+    """Shard a 1-D norm weight along dim 0 to match a preceding ColwiseParallel.
+
+    OLMo3 applies QK-norm *before* the head reshape, so the norm weight has
+    shape [num_heads * head_dim] and must be column-sharded to match the
+    TP-sharded q_proj / k_proj output.  (Qwen3's norm is per-head [head_dim]
+    and doesn't need this.)
+    """
+
+    def _apply(self, module: torch.nn.Module, device_mesh: DeviceMesh) -> torch.nn.Module:
+        def _partition_fn(name: str, module: torch.nn.Module, device_mesh: DeviceMesh) -> None:
+            if hasattr(module, "weight") and not isinstance(module.weight, DTensor):
+                module.weight = torch.nn.Parameter(
+                    distribute_tensor(module.weight, device_mesh, [Shard(0)]),
+                    requires_grad=module.weight.requires_grad,
+                )
+
+        return distribute_module(module, device_mesh, _partition_fn)
+
+
+def _parallelize_olmo3(
+    model: Olmo3ForCausalLM,
+    sequence_parallel: bool = False,
+) -> dict[str, ParallelStyle]:
+    """Parallelizes an Olmo3ForCausalLM model across data and tensor parallel dimensions."""
+
+    class Olmo3QKNorm(SequenceParallel):
+        @staticmethod
+        def _prepare_input_fn(sequence_sharding, mod, inputs, device_mesh):
+            input_tensor = inputs[0]
+            if isinstance(input_tensor, DTensor):
+                assert input_tensor.placements == (Shard(dim=2),)
+                return input_tensor
+            elif isinstance(input_tensor, torch.Tensor):
+                return DTensor.from_local(
+                    input_tensor, device_mesh, sequence_sharding, run_check=False
+                )
+            else:
+                raise ValueError(
+                    f"expecting input of {mod} to be a torch.Tensor or DTensor, but got {input_tensor}"
+                )
+
+    if sequence_parallel:
+        base_model_tp_plan = {
+            "lm_head": ColwiseParallel(
+                input_layouts=Shard(1),
+                output_layouts=Shard(-1),
+                use_local_output=False,
+            ),
+            "model.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "model.rotary_embs": RotaryEmbedParallel(),
+            "model.norm": SequenceParallel(),
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(output_layouts=Shard(1)),
+            "model.layers.*.self_attn.q_norm": _ShardNormWeight(),
+            "model.layers.*.self_attn.k_norm": _ShardNormWeight(),
+            "model.layers.*.post_attention_layernorm": SequenceParallel(),
+            "model.layers.*.post_feedforward_layernorm": SequenceParallel(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(output_layouts=Shard(1)),
+        }
+    else:
+        # OLMo3 applies QK-norm before the head reshape, so the norm weight
+        # has shape [num_heads * head_dim].  With TP the q/k_proj outputs are
+        # column-sharded and the norm weight must be sharded to match.  We
+        # keep q/k/v_proj outputs as DTensors (use_local_output=False) so the
+        # norm sees DTensor input × DTensor weight — both Shard(-1/0).
+        base_model_tp_plan = {
+            "lm_head": ColwiseParallel(
+                output_layouts=Shard(-1), use_local_output=False
+            ),
+            "model.embed_tokens": RowwiseParallel(
+                input_layouts=Replicate(),
+            ),
+            "model.layers.*.self_attn.q_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.k_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.v_proj": ColwiseParallel(use_local_output=False),
+            "model.layers.*.self_attn.o_proj": RowwiseParallel(),
+            "model.layers.*.self_attn.q_norm": _ShardNormWeight(),
+            "model.layers.*.self_attn.k_norm": _ShardNormWeight(),
+            "model.layers.*.mlp.up_proj": ColwiseParallel(),
+            "model.layers.*.mlp.gate_proj": ColwiseParallel(),
+            "model.layers.*.mlp.down_proj": RowwiseParallel(),
+        }
+
+    return cast(dict[str, ParallelStyle], base_model_tp_plan)
+
+
 PARALLIZE_FUNCTIONS: dict[
     type[torch.nn.Module], Callable[..., dict[str, ParallelStyle]]
 ] = {
     Qwen2ForCausalLM: _parallelize_qwen,
     Qwen3ForCausalLM: _parallelize_qwen,
     LlamaForCausalLM: _parallelize_llama,
+    Olmo3ForCausalLM: _parallelize_olmo3,
     # gemma-3-1b-it uses Gemma3ForCausalLM since it is a text-only model
     Gemma3ForCausalLM: _parallelize_gemma3,
     # The larger gemma models use Gemma3ForConditionalGeneration, which are for text-image input

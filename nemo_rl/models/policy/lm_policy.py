@@ -551,8 +551,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         all_topk_indices = [wb["topk_indices"] for wb in worker_batches]
 
         stacked: BatchedDataDict[TopkLogitsOutputSpec] = BatchedDataDict()
-        stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
-        stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
+        if len(all_topk_logits) == 1:
+            # Avoid duplicating very large [B, S, K] tensors for DP=1 runs.
+            stacked["topk_logits"] = all_topk_logits[0]
+            stacked["topk_indices"] = all_topk_indices[0]
+        else:
+            stacked["topk_logits"] = torch.cat(all_topk_logits, dim=0)
+            stacked["topk_indices"] = torch.cat(all_topk_indices, dim=0)
 
         if self.use_dynamic_batches or self.use_sequence_packing:
             stacked.reorder_data(unsorted_data_indices)

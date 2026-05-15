@@ -32,7 +32,6 @@ from nemo_rl.data.interfaces import (
     VLMMessageLogType,
 )
 from nemo_rl.data.llm_message_utils import (
-    get_first_index_that_differs,
     get_formatted_message_log,
 )
 
@@ -544,6 +543,7 @@ def math_hf_data_processor(
     # Build template fields shared by teacher prompts
     teacher_message_log = None
     teacher_prefix_message_log = None
+    format_kwargs: dict[str, str] = {}
     if (
         task_data_spec.teacher_prompt is not None
         or task_data_spec.teacher_prefix_prompt is not None
@@ -617,7 +617,7 @@ def math_hf_data_processor(
                 else:
                     trace_content = stripped
 
-            messages_raw: list[dict[str, str]] = []
+            messages_raw: list[dict[str, Any]] = []
             if system_prompt_text is not None:
                 messages_raw.append(
                     {
@@ -625,10 +625,18 @@ def math_hf_data_processor(
                         "content": _format_refine_chat_content(system_prompt_text),
                     }
                 )
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": trace_content,
+            }
+            if "<think>" in trace_content and "</think>" in trace_content:
+                # Qwen3's chat template strips reasoning from historical assistant
+                # turns unless this field is present. Keep the dataset trace exact.
+                assistant_message["reasoning_content"] = ""
             messages_raw.extend(
                 [
                     {"role": "user", "content": student_prompt_content},
-                    {"role": "assistant", "content": trace_content},
+                    assistant_message,
                     {
                         "role": "user",
                         "content": _format_refine_chat_content(refine_prompt_text),
@@ -636,32 +644,58 @@ def math_hf_data_processor(
                 ]
             )
 
+            def _split_qwen_style_context(rendered: str) -> list[str] | None:
+                marker_positions: list[int] = []
+                search_start = 0
+                for msg in messages_raw:
+                    marker = f"<|im_start|>{msg['role']}\n"
+                    pos = rendered.find(marker, search_start)
+                    if pos < 0:
+                        return None
+                    marker_positions.append(pos)
+                    search_start = pos + len(marker)
+                return [
+                    rendered[start : marker_positions[i + 1]]
+                    if i + 1 < len(marker_positions)
+                    else rendered[start:]
+                    for i, start in enumerate(marker_positions)
+                ]
+
             teacher_ml: list[dict[str, Any]] = []
-            prev_formatted = ""
-            for j, msg in enumerate(messages_raw):
-                is_last = j == len(messages_raw) - 1
-                formatted_full: str = tokenizer.apply_chat_template(  # type: ignore
-                    messages_raw[: j + 1],
-                    tokenize=False,
-                    add_generation_prompt=is_last,
-                    add_special_tokens=False,
+            rendered_context: str = tokenizer.apply_chat_template(  # type: ignore
+                messages_raw,
+                tokenize=False,
+                add_generation_prompt=True,
+                add_special_tokens=False,
+            )
+            chunks = _split_qwen_style_context(rendered_context)
+            if chunks is None:
+                chunks = [
+                    tokenizer.apply_chat_template(  # type: ignore
+                        messages_raw,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        add_special_tokens=False,
+                    )
+                ] + [""] * (len(messages_raw) - 1)
+
+            for msg, chunk in zip(messages_raw, chunks):
+                token_ids = (
+                    tokenizer(
+                        chunk,
+                        return_tensors="pt",
+                        add_special_tokens=False,
+                    )["input_ids"][0]
+                    if chunk
+                    else torch.empty(0, dtype=torch.long)
                 )
-                diff_idx = get_first_index_that_differs(
-                    prev_formatted, formatted_full
-                )
-                chunk = formatted_full[diff_idx:]
 
                 new_msg: dict[str, Any] = {
                     "role": msg["role"],
                     "content": chunk,
+                    "token_ids": token_ids,
                 }
-                new_msg["token_ids"] = tokenizer(
-                    chunk,
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                )["input_ids"][0]
                 teacher_ml.append(new_msg)
-                prev_formatted = formatted_full
 
             return teacher_ml
 
@@ -693,6 +727,12 @@ def math_hf_data_processor(
                 : min(4, max_seq_length // len(message_log))
             ]
         loss_multiplier = 0.0
+
+    if loss_multiplier > 0.0 and task_data_spec.column_mapping:
+        for mapped_name in task_data_spec.column_mapping.values():
+            if not format_kwargs.get(mapped_name):
+                loss_multiplier = 0.0
+                break
 
     output: DatumSpec = {
         "message_log": message_log,

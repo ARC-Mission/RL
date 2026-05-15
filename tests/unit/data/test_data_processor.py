@@ -69,6 +69,60 @@ class DummyTokenizer:
         return {"input_ids": encoded}
 
 
+class QwenThinkingTokenizer(DummyTokenizer):
+    def apply_chat_template(
+        self,
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_special_tokens=False,
+    ):
+        last_query_index = len(messages) - 1
+        for index in range(len(messages) - 1, -1, -1):
+            if messages[index]["role"] == "user":
+                last_query_index = index
+                break
+
+        rendered = ""
+        for index, message in enumerate(messages):
+            role = message["role"]
+            content = message["content"]
+            if role in ("system", "user"):
+                rendered += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+                continue
+
+            if role == "assistant":
+                reasoning_content = ""
+                if isinstance(message.get("reasoning_content"), str):
+                    reasoning_content = message["reasoning_content"]
+                elif "</think>" in content:
+                    reasoning_content = (
+                        content.split("</think>")[0]
+                        .rstrip("\n")
+                        .split("<think>")[-1]
+                        .lstrip("\n")
+                    )
+                    content = content.split("</think>")[-1].lstrip("\n")
+
+                rendered += f"<|im_start|>{role}\n"
+                if index > last_query_index and (
+                    index == len(messages) - 1 or reasoning_content
+                ):
+                    rendered += (
+                        "<think>\n"
+                        + reasoning_content.strip("\n")
+                        + "\n</think>\n\n"
+                        + content.lstrip("\n")
+                    )
+                else:
+                    rendered += content
+                rendered += "<|im_end|>\n"
+
+        if add_generation_prompt:
+            rendered += "<|im_start|>assistant\n"
+        return rendered
+
+
 def test_math_data_processor():
     raw_dataset = Dataset.from_list(
         [
@@ -283,6 +337,41 @@ def test_math_hf_data_processor_chat_teacher_after_reasoning_mode():
         msg["content"] for msg in fallback_result["teacher_message_log"]
     )
     assert "assistant: <think>only reasoning</think>   \n" in fallback_chat
+
+
+def test_math_hf_data_processor_chat_teacher_preserves_qwen_thinking_history_once():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Find z."},
+            {"role": "assistant", "content": "z=3"},
+        ],
+        "static_answer": "<think>hidden reasoning</think>\nPolished final answer.",
+        "task_name": "math",
+    }
+
+    result = math_hf_data_processor(
+        datum_dict=datum_dict,
+        task_data_spec=_chat_teacher_task_spec(),
+        tokenizer=QwenThinkingTokenizer(),
+        max_seq_length=512,
+        idx=0,
+    )
+
+    teacher_message_log = result["teacher_message_log"]
+    rendered_teacher_chat = "".join(msg["content"] for msg in teacher_message_log)
+
+    assert [msg["role"] for msg in teacher_message_log] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert rendered_teacher_chat.count("<think>hidden reasoning</think>") == 1
+    assert rendered_teacher_chat.count("Polished final answer.") == 1
+    assert rendered_teacher_chat.index("Polished final answer.") < rendered_teacher_chat.index(
+        "Your job is to produce a better reasoning trace"
+    )
+    assert rendered_teacher_chat.endswith("<|im_start|>assistant\n")
 
 
 @pytest.fixture

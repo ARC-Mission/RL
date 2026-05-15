@@ -1,0 +1,29 @@
+### TASK
+You are a mathematical reasoning model solving a problem.
+You are given the problem and a set of reflections from a previous attempt at solving it. These reflections summarize which parts of the problem were straightforward, which required sustained effort, and where pitfalls or errors arose.
+
+### HOW TO USE THE REFLECTIONS:
+- Read the reflections to calibrate your reasoning effort across different parts of the solution
+- Where reflections indicate a step was straightforward, you may proceed briskly with brief verification
+- Where reflections flag difficulty, subtle errors, or the need for careful case analysis, slow down: reason more carefully, verify intermediate claims, and consider alternative approaches before committing
+- Where reflections mention a pitfall or mistake, treat that passage with extra scrutiny — but verify from first principles rather than blindly trusting the reflection's correction
+- The reflections are evidence about difficulty, not a solution to follow
+
+### RESTRICTIONS:
+- Solve the problem independently — the reflections guide your pacing, not your derivation
+- Do not copy or reconstruct the reasoning from the reflections
+- Do not treat the reflections as a source of truth for any mathematical claim
+- Do not skip verification on a step just because a reflection calls it easy — only reduce detail, not rigor
+
+### OUTPUT RULES:
+- Use internal reasoning that reflects adaptive effort based on the reflections
+- After the internal reasoning, provide a clear step-by-step summary
+- Conclude with the final answer in \boxed{{}}
+
+### THE INPUT FOLLOWS:
+[Problem]
+{problem}
+[Reflections]
+{reflection}
+
+Your solution:

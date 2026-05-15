@@ -1,17 +1,18 @@
-# Distillation: Qwen3-8B self-distill, chat-style rewrite teacher
-# Cluster: Berlin standalone, 1 node x 4 H100 80GB GPUs
+# Distillation: OLMo3-7B self-distill, v14 teacher prompt, mix50 wu25
+# Cluster: Berlin — 1 node × 4 H100 80GB GPUs
 #
-# Parallelism:
-#   TP=2, CP=2, DP=1 on 4 GPUs.
-#   vLLM TP=2. H100 80GB should fit 8B generation with 33k-token context
-#   while context parallelism keeps the long teacher sequence manageable.
+# Parallelism (4 GPUs total):
+#   TP=2, CP=1, DP=2
+#   vLLM TP=2
 #
-# Teacher context:
-#   [system(rewrite_teacher_system.txt)]
-#   [user(cot.txt with {problem})]
-#   [assistant(static answer from qwen3_4b_answer)]
-#   [user(rewrite_teacher_chat.txt with {problem})]
-#   [assistant(live student rollout)]  # appended later; this is the only scored span
+# Training dynamics (matching Qwen3-8B Jupiter v14-mix50-wu25):
+#   LR = 5e-6, warmup 25 steps (linear → constant)
+#   GBS = 64, topk = 512, reverse KL, 1000 steps
+#   teacher_student_prefix_fraction = 0.50
+#   val_at_start = true
+#
+# Teacher prompt: teacher_rewrite_v14_independent_check_improved.txt
+#   {trace} ← mapped from qwen3_8b_answer column
 
 distillation:
     num_prompts_per_step: 64
@@ -26,7 +27,7 @@ distillation:
     val_at_end: false
     max_val_samples: 2560
     topk_logits_k: 512
-    teacher_student_prefix_fraction: 0.0
+    teacher_student_prefix_fraction: 0.50
     teacher_student_prefix_fraction_start: null
     teacher_student_prefix_fraction_warmup_steps: null
     val_max_total_sequence_length: 33280
@@ -41,7 +42,7 @@ loss_fn:
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/RL/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-chat-teacher"
+    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/RL/checkpoints/d-olmo3-7b-v14-mix50-wu25"
     metric_name: null
     higher_is_better: true
     keep_top_k: 3
@@ -51,7 +52,7 @@ checkpointing:
     save_consolidated: false
 
 policy: &POLICY_BASE
-    model_name: "Qwen/Qwen3-8B"
+    model_name: "allenai/Olmo-3-7B-Think"
     tokenizer:
         name: ${..model_name}
         chat_template_kwargs: null
@@ -59,7 +60,7 @@ policy: &POLICY_BASE
     train_micro_batch_size: 2
     generation_batch_size: 64
     logprob_batch_size: 2
-    max_total_sequence_length: 17408  # 800 prompt + 16384 generation, div by TP x CP x 2 = 8
+    max_total_sequence_length: 17408
     precision: "bfloat16"
     logprob_chunk_size: null
 
@@ -72,13 +73,13 @@ policy: &POLICY_BASE
         sequence_parallel: false
         activation_checkpointing: true
         tensor_parallel_size: 2
-        context_parallel_size: 2
+        context_parallel_size: 1
         custom_parallel_plan: null
 
     dynamic_batching:
         enabled: true
-        train_mb_tokens: 32768
-        logprob_mb_tokens: 32768
+        train_mb_tokens: 17408
+        logprob_mb_tokens: 17408
         sequence_length_round: 64
 
     sequence_packing:
@@ -104,14 +105,14 @@ policy: &POLICY_BASE
         enabled: false
         empty_unused_memory_level: 0
         activation_checkpointing: false
-        converter_type: "Qwen3ForCausalLM"
+        converter_type: "Olmo3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
-        pipeline_model_parallel_size: 2
+        pipeline_model_parallel_size: 1
         num_layers_in_first_pipeline_stage: null
         num_layers_in_last_pipeline_stage: null
-        context_parallel_size: 2
+        context_parallel_size: 1
         pipeline_dtype: ${policy.precision}
         sequence_parallel: false
         freeze_moe_router: true
@@ -151,7 +152,7 @@ policy: &POLICY_BASE
             weight_decay_incr_style: "constant"
             lr_decay_style: "constant"
             lr_decay_iters: 1000
-            lr_warmup_iters: 50
+            lr_warmup_iters: 25
             lr_warmup_init: 2.0e-6
 
         distributed_data_parallel_config:
@@ -172,12 +173,12 @@ policy: &POLICY_BASE
           kwargs:
               start_factor: 0.1
               end_factor: 1.0
-              total_iters: 10
+              total_iters: 25
         - name: "torch.optim.lr_scheduler.ConstantLR"
           kwargs:
               factor: 1.0
               total_iters: 10000000000
-        - milestones: [10]
+        - milestones: [25]
 
     generation:
         backend: "vllm"
@@ -210,8 +211,12 @@ policy: &POLICY_BASE
 
 teacher:
     <<: *POLICY_BASE
-    model_name: "Qwen/Qwen3-8B"
+    model_name: "allenai/Olmo-3-7B-Think"
     max_total_sequence_length: 33280
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        tensor_parallel_size: 2
+        context_parallel_size: 1
     dynamic_batching:
         enabled: true
         logprob_mb_tokens: 40960
@@ -223,29 +228,27 @@ data:
     train:
         dataset_name: OpenThoughtsMath
     validation:
+        - dataset_name: AIME2024
+          repeat: 4
+          teacher_prompt_file: null
         - dataset_name: AIME2025
           repeat: 4
           teacher_prompt_file: null
-          teacher_refine_prompt_file: null
-          teacher_refine_system_prompt_file: null
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        teacher_prompt_file: null
+        teacher_prompt_file: "examples/prompts/teacher_rewrite_v14_independent_check_improved.txt"
         teacher_prefix_prompt_file: null
-        teacher_refine_system_prompt_file: "examples/prompts/rewrite_teacher_system.txt"
-        teacher_refine_prompt_file: "examples/prompts/rewrite_teacher_chat.txt"
-        teacher_refine_assistant_content_mode: "full"
         env_name: "math"
         column_mapping:
-            qwen3_4b_answer: trace
+            qwen3_8b_answer: trace
 
 env:
     math:
         num_workers: 8
 
 logger:
-    log_dir: "logs/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-chat-teacher"
+    log_dir: "logs/d-olmo3-7b-v14-mix50-wu25"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -257,10 +260,10 @@ logger:
         flush_interval: 10
     wandb:
         project: "nemo-distillation"
-        name: "distillation-8b-chat-teacher-4btrace-${data.train.dataset_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "d-olmo3-7b-v14-mix50-wu25"
     swanlab:
         project: "nemo-distillation"
-        name: "distillation-8b-chat-teacher-4btrace-${data.train.dataset_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "d-olmo3-7b-v14-mix50-wu25"
 
 cluster:
     gpus_per_node: 4

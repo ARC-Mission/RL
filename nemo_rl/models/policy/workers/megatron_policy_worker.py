@@ -682,7 +682,12 @@ class MegatronPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface)
 
         no_grad.__exit__(None, None, None)
         return BatchedDataDict.from_batches(
-            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
+            [
+                {
+                    "topk_logits": topk_logits.cpu(),
+                    "topk_indices": topk_indices.to(device="cpu", dtype=torch.int32),
+                }
+            ]
         )
 
     @wrap_with_nvtx_name("megatron_policy_worker/generate")

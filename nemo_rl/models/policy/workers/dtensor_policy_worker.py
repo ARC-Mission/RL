@@ -1626,7 +1626,7 @@ class DTensorPolicyWorkerImpl(AbstractPolicyWorker, ColocatablePolicyInterface):
                 # Keep only real sequence tokens (no trimming here; padded positions can be masked downstream)
                 # Shapes remain [B, S, k].
                 out_topk_vals.append(vals.cpu())
-                out_topk_idx.append(idx.cpu())
+                out_topk_idx.append(idx.to(device="cpu", dtype=torch.int32))
 
         ret = BatchedDataDict[Any]()
         # Pad each micro-batch result on sequence dim to common length (S), similar to get_logprobs

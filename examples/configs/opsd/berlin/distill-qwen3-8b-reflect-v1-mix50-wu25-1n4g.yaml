@@ -1,17 +1,17 @@
-# Distillation: Qwen3-8B self-distill, chat-style rewrite teacher
-# Cluster: Berlin standalone, 1 node x 4 H100 80GB GPUs
+# Distillation: Qwen3-8B self-distill, reflection-guided teacher, mix50 wu25
+# Cluster: Berlin, 1 node x 4 H100 GPUs
 #
-# Parallelism:
-#   TP=2, CP=2, DP=1 on 4 GPUs.
-#   vLLM TP=2. H100 80GB should fit 8B generation with 33k-token context
-#   while context parallelism keeps the long teacher sequence manageable.
+# Parallelism (4 GPUs total):
+#   policy TP=2, CP=2 -> DP=1
+#   teacher TP=2, CP=2 -> DP=1
+#   vLLM TP=2
 #
-# Teacher context:
-#   [system(rewrite_teacher_system.txt)]
-#   [user(cot.txt with {problem})]
-#   [assistant(static answer from qwen3_4b_answer)]
-#   [user(rewrite_teacher_chat.txt with {problem})]
-#   [assistant(live student rollout)]  # appended later; this is the only scored span
+# Training dynamics identical to d-qwen3-8b-v14-mix50-wu25-1n4g except:
+#   - Teacher prompt: teacher_reflection_v1_adaptive_effort.txt
+#     {reflection} is mapped from qwen3_8b_reflectionsv1_extracted
+#     (only the <reflection> blocks, not the full reasoning trace).
+#   - No rewrite/two-pass; teacher solves independently using reflections
+#     to calibrate reasoning effort.
 
 distillation:
     num_prompts_per_step: 64
@@ -22,11 +22,11 @@ distillation:
     val_batch_size: 512
     val_period: 25
     val_steps: [10]
-    val_at_start: false
+    val_at_start: true
     val_at_end: false
     max_val_samples: 2560
     topk_logits_k: 512
-    teacher_student_prefix_fraction: 0.0
+    teacher_student_prefix_fraction: 0.50
     teacher_student_prefix_fraction_start: null
     teacher_student_prefix_fraction_warmup_steps: null
     val_max_total_sequence_length: 33280
@@ -41,7 +41,7 @@ loss_fn:
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/RL/checkpoints/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-chat-teacher"
+    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/checkpoints/d-qwen3-8b-reflect-v1-mix50-wu25-1n4g-berlin"
     metric_name: null
     higher_is_better: true
     keep_top_k: 3
@@ -59,7 +59,7 @@ policy: &POLICY_BASE
     train_micro_batch_size: 2
     generation_batch_size: 64
     logprob_batch_size: 2
-    max_total_sequence_length: 17408  # 800 prompt + 16384 generation, div by TP x CP x 2 = 8
+    max_total_sequence_length: 17408
     precision: "bfloat16"
     logprob_chunk_size: null
 
@@ -77,7 +77,7 @@ policy: &POLICY_BASE
 
     dynamic_batching:
         enabled: true
-        train_mb_tokens: 32768
+        train_mb_tokens: 18432
         logprob_mb_tokens: 32768
         sequence_length_round: 64
 
@@ -151,7 +151,7 @@ policy: &POLICY_BASE
             weight_decay_incr_style: "constant"
             lr_decay_style: "constant"
             lr_decay_iters: 1000
-            lr_warmup_iters: 50
+            lr_warmup_iters: 25
             lr_warmup_init: 2.0e-6
 
         distributed_data_parallel_config:
@@ -172,17 +172,17 @@ policy: &POLICY_BASE
           kwargs:
               start_factor: 0.1
               end_factor: 1.0
-              total_iters: 10
+              total_iters: 25
         - name: "torch.optim.lr_scheduler.ConstantLR"
           kwargs:
               factor: 1.0
               total_iters: 10000000000
-        - milestones: [10]
+        - milestones: [25]
 
     generation:
         backend: "vllm"
         max_new_tokens: 16384
-        temperature: 0.6
+        temperature: 1.0
         top_p: 1.0
         top_k: null
         stop_token_ids: null
@@ -194,7 +194,7 @@ policy: &POLICY_BASE
             tensor_parallel_size: 2
             pipeline_parallel_size: 1
             expert_parallel_size: 1
-            gpu_memory_utilization: 0.85
+            gpu_memory_utilization: 0.5
             max_model_len: 33280
             enforce_eager: False
             use_deep_gemm: False
@@ -212,9 +212,13 @@ teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-8B"
     max_total_sequence_length: 33280
+    dtensor_cfg:
+        <<: *DTENSOR_BASE
+        tensor_parallel_size: 2
+        context_parallel_size: 2
     dynamic_batching:
         enabled: true
-        logprob_mb_tokens: 40960
+        logprob_mb_tokens: 65536
         sequence_length_round: 64
 
 data:
@@ -223,29 +227,33 @@ data:
     train:
         dataset_name: OpenThoughtsMath
     validation:
+        - dataset_name: math500
+          repeat: 1
+          teacher_prompt_file: null
+        - dataset_name: AIME2024
+          repeat: 4
+          teacher_prompt_file: null
         - dataset_name: AIME2025
           repeat: 4
           teacher_prompt_file: null
-          teacher_refine_prompt_file: null
-          teacher_refine_system_prompt_file: null
+        - dataset_name: AIME2026
+          repeat: 4
+          teacher_prompt_file: null
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        teacher_prompt_file: null
+        teacher_prompt_file: "examples/prompts/teacher_reflection_v1_adaptive_effort.txt"
         teacher_prefix_prompt_file: null
-        teacher_refine_system_prompt_file: "examples/prompts/rewrite_teacher_system.txt"
-        teacher_refine_prompt_file: "examples/prompts/rewrite_teacher_chat.txt"
-        teacher_refine_assistant_content_mode: "full"
         env_name: "math"
         column_mapping:
-            qwen3_4b_answer: trace
+            qwen3_8b_reflectionsv1_extracted: reflection
 
 env:
     math:
         num_workers: 8
 
 logger:
-    log_dir: "logs/distillation-${policy.model_name}-${loss_fn.kl_type}-lr${policy.optimizer.kwargs.lr}-bs${policy.train_global_batch_size}-topk${distillation.topk_logits_k}-chat-teacher"
+    log_dir: "logs/d-qwen3-8b-reflect-v1-mix50-wu25-1n4g-berlin"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -257,10 +265,10 @@ logger:
         flush_interval: 10
     wandb:
         project: "nemo-distillation"
-        name: "distillation-8b-chat-teacher-4btrace-${data.train.dataset_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "d-qwen3-8b-reflect-v1-mix50-wu25-1n4g-berlin"
     swanlab:
         project: "nemo-distillation"
-        name: "distillation-8b-chat-teacher-4btrace-${data.train.dataset_name}-${loss_fn.kl_type}-topk${distillation.topk_logits_k}"
+        name: "d-qwen3-8b-reflect-v1-mix50-wu25-1n4g-berlin"
 
 cluster:
     gpus_per_node: 4

@@ -745,7 +745,7 @@ def _inject_student_rollout_into_teacher_message_logs(
                 msg["token_loss_mask"] = torch.zeros_like(msg["token_ids"])
             # Append the live student rollout — this is what the teacher scores.
             for msg in student_ml:
-                if msg["role"] != "user":
+                if msg["role"] not in ("user", "environment"):
                     copied = deepcopy(msg)
                     copied["token_loss_mask"] = torch.ones_like(copied["token_ids"])
                     teacher_ml.append(copied)
@@ -755,6 +755,7 @@ def _debug_print_first_sample(
     train_data: BatchedDataDict[Any],
     teacher_data: BatchedDataDict[Any],
     tokenizer: TokenizerType,
+    source_batch: Optional[BatchedDataDict[Any]] = None,
 ) -> None:
     """Print one-shot debug traces for sample 0 in distillation."""
     if train_data.size == 0:
@@ -763,7 +764,8 @@ def _debug_print_first_sample(
 
     student_ids = train_data["input_ids"][0].detach().cpu()
     teacher_ids = teacher_data["input_ids"][0].detach().cpu()
-    teacher_mask = train_data["token_mask"][0].detach().cpu()
+    student_scoring_mask = train_data["token_mask"][0].detach().cpu()
+    teacher_scoring_mask = teacher_data["token_mask"][0].detach().cpu()
     teacher_topk_logits = train_data["teacher_topk_logits"][0].detach().cpu()
     teacher_topk_indices = train_data["teacher_topk_indices"][0].detach().cpu()
 
@@ -776,14 +778,73 @@ def _debug_print_first_sample(
         skip_special_tokens=False,
     )
 
-    scored_positions = teacher_mask.nonzero(as_tuple=True)[0]
+    scored_positions = student_scoring_mask.nonzero(as_tuple=True)[0]
+    teacher_scored_positions = teacher_scoring_mask.nonzero(as_tuple=True)[0]
     preview_n = min(10, len(scored_positions))
 
     print("\n[DISTILL_DEBUG] ===== FIRST-STEP DEBUG (sample 0) =====", flush=True)
+    if (
+        source_batch is not None
+        and "teacher_message_log" in source_batch
+        and source_batch.size > 0
+    ):
+        teacher_message_log = source_batch["teacher_message_log"][0]
+        role_summary = []
+        context_roles = []
+        scored_roles = []
+        for message in teacher_message_log:
+            mask_sum = int(message.get("token_loss_mask", torch.tensor(0)).sum().item())
+            label = "scored" if mask_sum > 0 else "context"
+            role = message["role"]
+            role_summary.append(f"{role}({label})")
+            if mask_sum > 0:
+                scored_roles.append(role)
+            else:
+                context_roles.append(role)
+        print(
+            "[DISTILL_DEBUG] Teacher message log roles: "
+            + " -> ".join(role_summary),
+            flush=True,
+        )
+        print(
+            "[DISTILL_DEBUG] Teacher conditioning roles before live rollout: "
+            + " -> ".join(context_roles),
+            flush=True,
+        )
+        print(
+            "[DISTILL_DEBUG] Teacher scored live rollout roles: "
+            + " -> ".join(scored_roles),
+            flush=True,
+        )
+
     print("[DISTILL_DEBUG] Full student sequence (raw decode):", flush=True)
     print(student_text, flush=True)
-    print("[DISTILL_DEBUG] Full teacher input sequence (raw decode):", flush=True)
-    print(teacher_text, flush=True)
+    if len(teacher_scored_positions) > 0:
+        first_teacher_scored_pos = int(teacher_scored_positions[0].item())
+        last_teacher_scored_pos = int(teacher_scored_positions[-1].item())
+        teacher_conditioning_text = tokenizer.decode(
+            teacher_ids[:first_teacher_scored_pos].tolist(),
+            skip_special_tokens=False,
+        )
+        teacher_scored_text = tokenizer.decode(
+            teacher_ids[first_teacher_scored_pos : last_teacher_scored_pos + 1].tolist(),
+            skip_special_tokens=False,
+        )
+        print(
+            "[DISTILL_DEBUG] Teacher conditioning sequence before live rollout "
+            "(raw decode):",
+            flush=True,
+        )
+        print(teacher_conditioning_text, flush=True)
+        print(
+            "[DISTILL_DEBUG] Scored live student rollout appended after "
+            "teacher conditioning (raw decode):",
+            flush=True,
+        )
+        print(teacher_scored_text, flush=True)
+    else:
+        print("[DISTILL_DEBUG] Full teacher input sequence (raw decode):", flush=True)
+        print(teacher_text, flush=True)
     print(
         f"[DISTILL_DEBUG] Teacher scored positions count: {len(scored_positions)}",
         flush=True,
@@ -1137,7 +1198,12 @@ def distillation_train(
                         train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
                         train_data["teacher_topk_indices"] = teacher_topk["topk_indices"]
                     if total_steps == 0:
-                        _debug_print_first_sample(train_data, teacher_data, tokenizer)
+                        _debug_print_first_sample(
+                            train_data,
+                            teacher_data,
+                            tokenizer,
+                            source_batch=repeated_batch,
+                        )
 
                 # Free large intermediate tensors before training to reduce
                 # peak CPU memory.  train_data already holds the (aligned)
