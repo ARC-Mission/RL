@@ -22,9 +22,9 @@ distillation:
     max_num_steps: 500
     max_num_epochs: 1
     val_batch_size: 512
-    val_period: 25
-    val_steps: [10]
-    val_at_start: true
+    val_period: 0
+    val_steps: []
+    val_at_start: false
     val_at_end: false
     max_val_samples: 2560
     topk_logits_k: 512
@@ -54,6 +54,7 @@ checkpointing:
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-8B"
+    initial_weights_path: null
     tokenizer:
         name: ${..model_name}
         chat_template_kwargs: null
@@ -228,19 +229,7 @@ data:
     shuffle: true
     train:
         dataset_name: OpenThoughtsMath
-    validation:
-        - dataset_name: math500
-          repeat: 1
-          teacher_prompt_file: null
-        - dataset_name: AIME2024
-          repeat: 4
-          teacher_prompt_file: null
-        - dataset_name: AIME2025
-          repeat: 4
-          teacher_prompt_file: null
-        - dataset_name: AIME2026
-          repeat: 4
-          teacher_prompt_file: null
+    validation: null
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null

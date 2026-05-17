@@ -1,13 +1,11 @@
 #!/bin/bash
-# Submit Qwen3-8B v14-mix50-wu25 self-distillation on one Berlin H100 node.
+# Submit Qwen3-8B SFT on OpenThoughts rewrite traces on one Berlin H100 node.
+#
+# The dataset input is examples/prompts/cot.txt with {problem} filled from the
+# problem column. The supervised target is qwen3_8b_rewrite.
 #
 # Topology on 1 x 4 H100:
-#   policy TP=2, CP=1 -> DP=2
-#   teacher TP=2, CP=2 -> DP=1
-#   vLLM TP=2
-#
-# Training dynamics match the Jupiter 8B v14-mix50-wu25 run except for
-# lower data parallelism due to the smaller GPU allocation.
+#   policy TP=2, CP=2 -> DP=1
 
 set -euo pipefail
 
@@ -15,17 +13,18 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "$REPO_ROOT"
 
-CONFIG="${CONFIG:-examples/configs/opsd/berlin/distill-qwen3-8b-v14-mix50-wu25-1n4g.yaml}"
+CONFIG="${CONFIG:-examples/configs/recipes/llm/sft-qwen3-8b-openthoughts-rewrite-1n4g.yaml}"
 RAY_SUB="${RAY_SUB:-$SCRIPT_DIR/ray.sub}"
 NODES="${NODES:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
 SBATCH_TIME="${SBATCH_TIME:-24:00:00}"
-RUN_NAME="${RUN_NAME:-d-qwen3-8b-v14-mix50-wu25-1n4g-berlin}"
+EVAL_WATCHER_SBATCH_TIME="${EVAL_WATCHER_SBATCH_TIME:-12:00:00}"
+RUN_NAME="${RUN_NAME:-sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin}"
 QWEN3_TP_PLAN="${QWEN3_TP_PLAN:-examples.custom_parallel.custom_parallel.qwen_model_tp_plan_stable}"
 AUTO_EVAL_WATCHER="${AUTO_EVAL_WATCHER:-1}"
 EVAL_AT_START="${EVAL_AT_START:-1}"
-WANDB_PROJECT="${WANDB_PROJECT:-nemo-distillation}"
+WANDB_PROJECT="${WANDB_PROJECT:-nemo-sft}"
 WANDB_NAME="${WANDB_NAME:-$RUN_NAME}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 RUN_ID_PREFIX="$(printf '%s' "$RUN_NAME" | tr -cd '[:alnum:]_-' | cut -c1-40)"
@@ -57,12 +56,11 @@ cmd=(
   env
   WANDB_RUN_ID="$WANDB_RUN_ID"
   WANDB_RESUME=allow
-  uv run python examples/run_distillation.py
+  uv run python examples/run_sft.py
   --config "$CONFIG"
   cluster.num_nodes="$NODES"
   cluster.gpus_per_node="$GPUS_PER_NODE"
   policy.dtensor_cfg.custom_parallel_plan="$QWEN3_TP_PLAN"
-  teacher.dtensor_cfg.custom_parallel_plan="$QWEN3_TP_PLAN"
   checkpointing.checkpoint_dir="$CKPT_DIR"
   checkpointing.save_consolidated=true
   checkpointing.keep_top_k=null
@@ -105,6 +103,7 @@ if [[ "$AUTO_EVAL_WATCHER" == "1" ]]; then
   fi
 
   TRAINING_JOB_ID="$TRAINING_JOB_ID" \
+  SBATCH_TIME="$EVAL_WATCHER_SBATCH_TIME" \
   EVAL_WANDB_PROJECT="$WANDB_PROJECT" \
   EVAL_WANDB_NAME="$WANDB_NAME" \
   EVAL_WANDB_ENTITY="$WANDB_ENTITY" \

@@ -482,11 +482,13 @@ def get_formatted_message_log(
         which assumes that the first message is a string (not true for multimodal data). This helper function correctly handles all cases.
         """
         if isinstance(content, str):
-            return task_data_spec.prompt.format(content)
+            return task_data_spec.prompt.format(content, problem=content)
         # this is a list of dicts, format only the text ones
         for item in content:
             if item["type"] == "text":
-                item["text"] = task_data_spec.prompt.format(item["text"])
+                item["text"] = task_data_spec.prompt.format(
+                    item["text"], problem=item["text"]
+                )
         return content
 
     # ignore any system prompts

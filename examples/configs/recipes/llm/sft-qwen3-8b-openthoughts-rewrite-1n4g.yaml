@@ -1,0 +1,109 @@
+defaults: ../archive/sft.yaml
+
+sft:
+  max_num_epochs: 1
+  max_num_steps: 1400
+  val_period: 0
+  val_batches: 0
+  val_global_batch_size: 64
+  val_micro_batch_size: 1
+  val_at_start: false
+  val_at_end: false
+  seed: 42
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: /fast/project/HFMI_SynergyUnit/yll/checkpoints/sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin
+  metric_name: train:loss
+  higher_is_better: false
+  keep_top_k: 3
+  save_period: 100
+  checkpoint_must_save_by: null
+  model_save_format: safetensors
+  save_consolidated: true
+
+policy:
+  model_name: Qwen/Qwen3-8B
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: examples/prompts/qwen3_preserve_think.jinja
+    chat_template_kwargs: null
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  max_total_sequence_length: 16384
+  precision: bfloat16
+  offload_optimizer_for_logprob: false
+  dtensor_cfg:
+    _v2: true
+    enabled: true
+    cpu_offload: true
+    sequence_parallel: false
+    activation_checkpointing: true
+    tensor_parallel_size: 2
+    context_parallel_size: 2
+    custom_parallel_plan: null
+  dynamic_batching:
+    enabled: true
+    train_mb_tokens: 32768
+    sequence_length_round: 64
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1.0
+  optimizer:
+    name: torch.optim.AdamW
+    kwargs:
+      lr: 1.0e-5
+      weight_decay: 0.01
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      foreach: false
+      fused: false
+  megatron_cfg:
+    enabled: false
+
+data:
+  _override_: true
+  max_input_seq_length: ${policy.max_total_sequence_length}
+  add_bos: true
+  add_eos: true
+  add_generation_prompt: false
+  shuffle: true
+  num_workers: 8
+  train:
+    dataset_name: ResponseDataset
+    data_path: yllkryeziu/openthoughts114k-math-qwen3
+    input_key: problem
+    output_key: qwen3_8b_rewrite
+    normalize_qwen3_thinking: true
+    split: train
+    split_validation_size: 0.0
+    seed: ${sft.seed}
+  validation: null
+  default:
+    prompt_file: examples/prompts/cot.txt
+    system_prompt_file: null
+    processor: sft_processor
+
+logger:
+  log_dir: /fast/project/HFMI_SynergyUnit/yll/logs/sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin
+  wandb_enabled: true
+  tensorboard_enabled: true
+  mlflow_enabled: false
+  swanlab_enabled: false
+  monitor_gpus: true
+  wandb:
+    project: nemo-sft
+    name: sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin
+  tensorboard:
+    log_dir: tb_logs-sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin
+  mlflow:
+    experiment_name: sft
+    run_name: sft-qwen3-8b-openthoughts-rewrite-1n4g-berlin
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 1

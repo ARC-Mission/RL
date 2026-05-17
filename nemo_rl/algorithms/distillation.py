@@ -469,7 +469,8 @@ def setup(
         weights_path = Path(last_checkpoint_path) / "policy" / "weights"
         optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
     else:
-        weights_path = None
+        initial_weights_path = policy_config.get("initial_weights_path")
+        weights_path = Path(initial_weights_path) if initial_weights_path else None
         optimizer_path = None
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
@@ -1301,6 +1302,9 @@ def distillation_train(
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
+                        "student/entropy",
+                        "teacher/entropy",
+                        "distill/kl_reverse",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:

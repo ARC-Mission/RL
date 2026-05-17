@@ -20,6 +20,7 @@ class ResponseDatasetConfig(TypedDict):
     data_path: NotRequired[str]
     input_key: NotRequired[str]
     output_key: NotRequired[str]
+    normalize_qwen3_thinking: NotRequired[bool]
     subset: NotRequired[str | None]
     split: NotRequired[str]
     prompt_file: NotRequired[str | None]

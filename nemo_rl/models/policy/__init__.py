@@ -271,6 +271,9 @@ class DynamicBatchingConfig(TypedDict):
 
 class PolicyConfig(TypedDict):
     model_name: str
+    # Optional NeMo-native weights path used to initialize a fresh run.
+    # Resume checkpoints still take precedence when an algorithm checkpoint exists.
+    initial_weights_path: NotRequired[str | None]
     tokenizer: TokenizerConfig
     train_global_batch_size: int
     train_micro_batch_size: int

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 from typing import Any, Optional
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
@@ -44,6 +45,7 @@ class ResponseDataset(RawDataset):
         data_path: str,
         input_key: str = "input",
         output_key: str = "output",
+        normalize_qwen3_thinking: bool = False,
         subset: Optional[str] = None,
         split: Optional[str] = None,
         split_validation_size: float = 0,
@@ -52,6 +54,7 @@ class ResponseDataset(RawDataset):
     ):
         self.input_key = input_key
         self.output_key = output_key
+        self.normalize_qwen3_thinking = normalize_qwen3_thinking
 
         self.task_name = "-".join(data_path.split("/")[-2:]).split(".")[0]
         if self.task_name[0] == "-":
@@ -76,10 +79,45 @@ class ResponseDataset(RawDataset):
         self.split_train_validation(split_validation_size, seed)
 
     def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        output = data[self.output_key]
+        if self.normalize_qwen3_thinking:
+            output = _normalize_qwen3_thinking_output(str(output))
+
         return {
             "messages": [
                 {"role": "user", "content": data[self.input_key]},
-                {"role": "assistant", "content": data[self.output_key]},
+                {"role": "assistant", "content": output},
             ],
             "task_name": self.task_name,
         }
+
+
+_FINAL_ANSWER_MARKER_RE = re.compile(
+    r"(?im)^(?:-{3,}\s*)?(?:#{1,6}\s*)?(?:\*\*)?\s*final answer\s*(?:\*\*)?:?\s*$"
+)
+
+
+def _normalize_qwen3_thinking_output(text: str) -> str:
+    """Move final-answer text outside an unclosed Qwen3 thinking block."""
+    if "<think>" not in text or "</think>" in text:
+        return text
+
+    match = None
+    for candidate in _FINAL_ANSWER_MARKER_RE.finditer(text):
+        match = candidate
+
+    if match is None:
+        boxed_match = None
+        for candidate in re.finditer(r"\\boxed\s*\{", text):
+            boxed_match = candidate
+        if boxed_match is None:
+            return text.rstrip() + "\n</think>\n"
+
+        answer_start = text.rfind("\n", 0, boxed_match.start())
+        split_at = 0 if answer_start == -1 else answer_start + 1
+    else:
+        split_at = match.start()
+
+    reasoning = text[:split_at].rstrip()
+    answer = text[split_at:].lstrip()
+    return f"{reasoning}\n</think>\n\n{answer}"

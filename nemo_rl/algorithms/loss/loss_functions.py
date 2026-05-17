@@ -953,9 +953,21 @@ class DistillationLossFn(LossFunction):
                 + (1.0 - self.mixed_kl_weight) * kl_reverse
             )
 
+        per_token_reverse_kl = (
+            student_probs * (student_topk_logprobs - teacher_topk_logprobs)
+        ).sum(dim=-1)
+        per_token_student_entropy = -(
+            student_probs * student_topk_logprobs
+        ).sum(dim=-1)
+        per_token_teacher_entropy = -(
+            teacher_probs * teacher_topk_logprobs
+        ).sum(dim=-1)
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
         # Masking and reduction
+        distill_reverse_kl = None
+        student_entropy = None
+        teacher_entropy = None
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
@@ -969,11 +981,44 @@ class DistillationLossFn(LossFunction):
                 mask,
                 global_normalization_factor=global_valid_toks,
             )
+            distill_reverse_kl = masked_mean(
+                per_token_reverse_kl,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            student_entropy = masked_mean(
+                per_token_student_entropy,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
+            teacher_entropy = masked_mean(
+                per_token_teacher_entropy,
+                mask,
+                global_normalization_factor=global_valid_toks,
+            )
         else:
             kl_loss = per_token_kl.mean()
+            distill_reverse_kl = per_token_reverse_kl.mean()
+            student_entropy = per_token_student_entropy.mean()
+            teacher_entropy = per_token_teacher_entropy.mean()
 
         metrics = {
             "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "student/entropy": (
+                float(student_entropy.item())
+                if student_entropy.ndim == 0
+                else student_entropy
+            ),
+            "teacher/entropy": (
+                float(teacher_entropy.item())
+                if teacher_entropy.ndim == 0
+                else teacher_entropy
+            ),
+            "distill/kl_reverse": (
+                float(distill_reverse_kl.item())
+                if distill_reverse_kl.ndim == 0
+                else distill_reverse_kl
+            ),
             "num_valid_samples": data["input_ids"].shape[0],
         }
 
