@@ -978,6 +978,14 @@ def distillation_train(
     teacher_update_period: Optional[int] = master_config["distillation"].get(
         "teacher_update_period", None
     )
+    need_reference_kl = (
+        master_config["loss_fn"].get("reference_policy_kl_penalty", 0.0) != 0
+    )
+    if need_reference_kl and teacher_update_period:
+        raise ValueError(
+            "reference_policy_kl_penalty requires a frozen unconditioned reference; "
+            "disable distillation.teacher_update_period for this distillation path."
+        )
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -1140,9 +1148,10 @@ def distillation_train(
                         }
                     )
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
-                    train_data.update(
-                        flat_messages.get_multimodal_dict(as_tensors=False)
+                    extra_multimodal_data = flat_messages.get_multimodal_dict(
+                        as_tensors=False
                     )
+                    train_data.update(extra_multimodal_data)
                     train_data.to("cpu")
 
                     # Build separate teacher_data if teacher has a different prompt
@@ -1205,6 +1214,27 @@ def distillation_train(
                             tokenizer,
                             source_batch=repeated_batch,
                         )
+
+                    if need_reference_kl:
+                        print("▶ Computing reference policy logprobs...", flush=True)
+                        with timer.time("reference_logprob_inference"):
+                            reference_data = BatchedDataDict[Any](
+                                {
+                                    "input_ids": train_data["input_ids"],
+                                    "input_lengths": train_data["input_lengths"],
+                                    "token_mask": train_data["token_mask"],
+                                    "sample_mask": train_data["sample_mask"],
+                                    **extra_multimodal_data,
+                                }
+                            )
+                            reference_data.to("cpu")
+                            train_data["reference_policy_logprobs"] = (
+                                teacher_policy.get_logprobs(
+                                    reference_data,
+                                    timer=timer,
+                                )["logprobs"]
+                            )
+                            del reference_data
 
                 # Free large intermediate tensors before training to reduce
                 # peak CPU memory.  train_data already holds the (aligned)
@@ -1305,6 +1335,10 @@ def distillation_train(
                         "student/entropy",
                         "teacher/entropy",
                         "distill/kl_reverse",
+                        "distill/loss",
+                        "reference_policy/kl",
+                        "reference_policy/kl_loss",
+                        "reference_policy/logprob_diff",
                     }:
                         metrics[k] = np.mean(v).item()
                     else:

@@ -22,9 +22,10 @@ CKPT_PATH="$1"
 shift
 
 RAY_SUB="${RAY_SUB:-$SCRIPT_DIR/ray.sub}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-1}"
+GPUS_PER_NODE="${EVAL_GPUS_PER_NODE:-1}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-16}"
 SBATCH_TIME="${SBATCH_TIME:-12:00:00}"
+SBATCH_EXCLUDE="${SBATCH_EXCLUDE:-hai008}"
 RUN_NAME="${RUN_NAME:-eval-$(basename "$(dirname "$CKPT_PATH")")-$(basename "$CKPT_PATH")}"
 LOG_ROOT="${LOG_ROOT:-/fast/project/HFMI_SynergyUnit/yll/logs}"
 
@@ -35,7 +36,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-33280}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-32768}"
 TEMPERATURE="${TEMPERATURE:-0.6}"
 TP_SIZE="${TP_SIZE:-1}"
-EVAL_K_VALUE="${EVAL_K_VALUE:-4}"
+EVAL_K_VALUE="${EVAL_K_VALUE:-1}"
 EVAL_NUM_TESTS_PER_PROMPT="${EVAL_NUM_TESTS_PER_PROMPT:-4}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-${WANDB_PROJECT:-}}"
 EVAL_WANDB_NAME="${EVAL_WANDB_NAME:-${WANDB_NAME:-}}"
@@ -87,12 +88,22 @@ export EVAL_WANDB_ENTITY
 export EVAL_WANDB_RUN_ID
 export EVAL_TRAIN_STEP
 
+SBATCH_MEM="${SBATCH_MEM:-120G}"
+
+sbatch_args=(
+  --nodes=1
+  --gres="gpu:$GPUS_PER_NODE"
+  --cpus-per-task="$CPUS_PER_TASK"
+  --mem="$SBATCH_MEM"
+  --time="$SBATCH_TIME"
+  --job-name="$RUN_NAME"
+)
+if [[ -n "$SBATCH_EXCLUDE" ]]; then
+  sbatch_args+=(--exclude="$SBATCH_EXCLUDE")
+fi
+
 sbatch \
-  --nodes=1 \
-  --gres="gpu:$GPUS_PER_NODE" \
-  --cpus-per-task="$CPUS_PER_TASK" \
-  --time="$SBATCH_TIME" \
-  --job-name="$RUN_NAME" \
+  "${sbatch_args[@]}" \
   "$RAY_SUB"
 
 echo "Submitted eval job $RUN_NAME for $CKPT_PATH"

@@ -884,6 +884,10 @@ class DistillationLossConfig(TypedDict):
     kl_type: str
     mixed_kl_weight: float
     zero_outside_topk: bool
+    reference_policy_kl_penalty: NotRequired[float]
+    reference_policy_kl_type: NotRequired[str]
+    kl_input_clamp_value: NotRequired[float | None]
+    kl_output_clamp_value: NotRequired[float | None]
 
 
 class DistillationLossDataDict(TypedDict):
@@ -893,6 +897,7 @@ class DistillationLossDataDict(TypedDict):
     sample_mask: torch.Tensor
     teacher_topk_logits: torch.Tensor
     teacher_topk_indices: torch.Tensor
+    reference_policy_logprobs: NotRequired[torch.Tensor]
 
 
 class DistillationLossFn(LossFunction):
@@ -905,11 +910,21 @@ class DistillationLossFn(LossFunction):
         self.kl_type = cfg["kl_type"]
         self.mixed_kl_weight = cfg["mixed_kl_weight"]
         self.zero_outside_topk = cfg["zero_outside_topk"]
+        self.reference_policy_kl_penalty = cfg.get("reference_policy_kl_penalty", 0.0)
+        self.reference_policy_kl_type = cfg.get("reference_policy_kl_type", "k3")
+        self.kl_input_clamp_value = cfg.get("kl_input_clamp_value", None)
+        self.kl_output_clamp_value = cfg.get("kl_output_clamp_value", None)
         self.log_infinitesimal = -100
 
         assert self.kl_type in ["forward", "reverse", "mixed"], "Invalid KL type"
         assert self.mixed_kl_weight >= 0 and self.mixed_kl_weight <= 1, (
             "Invalid mixed KL weight"
+        )
+        assert self.reference_policy_kl_penalty >= 0, (
+            "reference_policy_kl_penalty must be non-negative"
+        )
+        assert self.reference_policy_kl_type in ["k1", "k2", "k3"], (
+            "Invalid reference policy KL type"
         )
 
     def __call__(
@@ -917,6 +932,7 @@ class DistillationLossFn(LossFunction):
         student_topk_logprobs: torch.Tensor,
         teacher_topk_logprobs: torch.Tensor,
         H_all: torch.Tensor | None,
+        student_logprobs: torch.Tensor | None,
         data: DistillationLossDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
@@ -968,6 +984,9 @@ class DistillationLossFn(LossFunction):
         distill_reverse_kl = None
         student_entropy = None
         teacher_entropy = None
+        reference_policy_kl = torch.zeros_like(per_token_kl.mean())
+        reference_policy_kl_loss = torch.zeros_like(reference_policy_kl)
+        reference_policy_logprob_diff = torch.zeros_like(reference_policy_kl)
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
             sample_mask = data["sample_mask"]
@@ -1002,8 +1021,55 @@ class DistillationLossFn(LossFunction):
             student_entropy = per_token_student_entropy.mean()
             teacher_entropy = per_token_teacher_entropy.mean()
 
+        if self.reference_policy_kl_penalty != 0:
+            if student_logprobs is None:
+                raise ValueError(
+                    "student_logprobs are required when reference_policy_kl_penalty is non-zero"
+                )
+            if "reference_policy_logprobs" not in data:
+                raise ValueError(
+                    "reference_policy_logprobs are required when reference_policy_kl_penalty is non-zero"
+                )
+
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, 1:]
+            max_len = min(student_logprobs.shape[1], reference_policy_logprobs.shape[1])
+            student_logprobs = student_logprobs[:, :max_len]
+            reference_policy_logprobs = reference_policy_logprobs[:, :max_len]
+            per_token_reference_kl = calculate_kl(
+                logprobs=student_logprobs,
+                logprobs_reference=reference_policy_logprobs,
+                kl_type=self.reference_policy_kl_type,
+                input_clamp_value=self.kl_input_clamp_value,
+                output_clamp_value=self.kl_output_clamp_value,
+            )
+            per_token_logprob_diff = student_logprobs - reference_policy_logprobs
+
+            if "token_mask" in data and "sample_mask" in data:
+                ref_token_mask = data["token_mask"][:, 1:][:, :max_len]
+                ref_sample_mask = data["sample_mask"]
+                ref_mask = ref_token_mask * ref_sample_mask.unsqueeze(-1)
+                reference_policy_kl = masked_mean(
+                    per_token_reference_kl,
+                    ref_mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+                reference_policy_logprob_diff = masked_mean(
+                    per_token_logprob_diff,
+                    ref_mask,
+                    global_normalization_factor=global_valid_toks,
+                )
+            else:
+                reference_policy_kl = per_token_reference_kl.mean()
+                reference_policy_logprob_diff = per_token_logprob_diff.mean()
+
+            reference_policy_kl_loss = (
+                self.reference_policy_kl_penalty * reference_policy_kl
+            )
+
+        loss = kl_loss + reference_policy_kl_loss
         metrics = {
-            "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            "loss": float(loss.item()) if loss.ndim == 0 else loss,
+            "distill/loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
             "student/entropy": (
                 float(student_entropy.item())
                 if student_entropy.ndim == 0
@@ -1019,7 +1085,22 @@ class DistillationLossFn(LossFunction):
                 if distill_reverse_kl.ndim == 0
                 else distill_reverse_kl
             ),
+            "reference_policy/kl": (
+                float(reference_policy_kl.item())
+                if reference_policy_kl.ndim == 0
+                else reference_policy_kl
+            ),
+            "reference_policy/kl_loss": (
+                float(reference_policy_kl_loss.item())
+                if reference_policy_kl_loss.ndim == 0
+                else reference_policy_kl_loss
+            ),
+            "reference_policy/logprob_diff": (
+                float(reference_policy_logprob_diff.item())
+                if reference_policy_logprob_diff.ndim == 0
+                else reference_policy_logprob_diff
+            ),
             "num_valid_samples": data["input_ids"].shape[0],
         }
 
-        return kl_loss, metrics
+        return loss, metrics

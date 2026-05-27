@@ -27,6 +27,7 @@ cmd=(
   EVAL_WANDB_NAME="${EVAL_WANDB_NAME:-}"
   EVAL_WANDB_ENTITY="${EVAL_WANDB_ENTITY:-}"
   EVAL_WANDB_RUN_ID="${EVAL_WANDB_RUN_ID:-}"
+  SBATCH_EXCLUDE="${SBATCH_EXCLUDE:-}"
   "$SCRIPT_DIR/watch_sft_checkpoints_eval.sh"
   "$CKPT_ROOT"
   "$@"

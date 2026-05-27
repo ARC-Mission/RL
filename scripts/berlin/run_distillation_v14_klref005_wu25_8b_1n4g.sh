@@ -1,13 +1,14 @@
 #!/bin/bash
-# Submit Qwen3-8B v14-mix50-wu25 self-distillation on one Berlin H100 node.
+# Submit Qwen3-8B v14 answer-trace self-distillation on one Berlin H100 node.
 #
 # Topology on 1 x 4 H100:
-#   policy TP=2, CP=1 -> DP=2
+#   policy TP=2, CP=2 -> DP=1
 #   teacher TP=2, CP=2 -> DP=1
 #   vLLM TP=2
 #
-# Training dynamics match the Jupiter 8B v14-mix50-wu25 run except for
-# lower data parallelism due to the smaller GPU allocation.
+# Training dynamics match the v14-mix50 answer-trace run except the old 50/50
+# teacher-prefix mix is replaced by an explicit KL anchor to the frozen
+# unconditioned policy on the same student rollout tokens.
 
 set -euo pipefail
 
@@ -15,13 +16,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 cd "$REPO_ROOT"
 
-CONFIG="${CONFIG:-examples/configs/opsd/berlin/distill-qwen3-8b-v14-mix50-wu25-1n4g.yaml}"
+CONFIG="${CONFIG:-examples/configs/opsd/berlin/distill-qwen3-8b-v14-klref-wu25-1n4g.yaml}"
 RAY_SUB="${RAY_SUB:-$SCRIPT_DIR/ray.sub}"
 NODES="${NODES:-1}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 CPUS_PER_TASK="${CPUS_PER_TASK:-32}"
 SBATCH_TIME="${SBATCH_TIME:-24:00:00}"
-RUN_NAME="${RUN_NAME:-d-qwen3-8b-v14-mix50-wu25-1n4g-berlin}"
+RUN_NAME="${RUN_NAME:-d-qwen3-8b-v14-klref005-wu25-1n4g-berlin}"
 QWEN3_TP_PLAN="${QWEN3_TP_PLAN:-examples.custom_parallel.custom_parallel.qwen_model_tp_plan_stable}"
 AUTO_EVAL_WATCHER="${AUTO_EVAL_WATCHER:-0}"
 EVAL_AT_START="${EVAL_AT_START:-0}"
@@ -34,8 +35,20 @@ WANDB_RUN_ID="${WANDB_RUN_ID:-${RUN_ID_PREFIX}-$(date +%Y%m%d%H%M%S)}"
 CKPT_ROOT="${CKPT_ROOT:-/fast/project/HFMI_SynergyUnit/yll/checkpoints}"
 LOG_ROOT="${LOG_ROOT:-/fast/project/HFMI_SynergyUnit/yll/logs}"
 CKPT_DIR="${CKPT_ROOT}/${RUN_NAME}"
-INITIAL_EVAL_MODEL="${INITIAL_EVAL_MODEL:-Qwen/Qwen3-8B}"
-INITIAL_EVAL_TOKENIZER="${INITIAL_EVAL_TOKENIZER:-$INITIAL_EVAL_MODEL}"
+if [[ -z "${INITIAL_EVAL_MODEL:-}" ]]; then
+  if [[ -n "${POLICY_INIT_WEIGHTS:-}" && -d "${POLICY_INIT_WEIGHTS}/model/consolidated" ]]; then
+    INITIAL_EVAL_MODEL="${POLICY_INIT_WEIGHTS}/model/consolidated"
+  else
+    INITIAL_EVAL_MODEL="Qwen/Qwen3-8B"
+  fi
+fi
+if [[ -z "${INITIAL_EVAL_TOKENIZER:-}" ]]; then
+  if [[ -n "${POLICY_INIT_WEIGHTS:-}" && -d "$(dirname "${POLICY_INIT_WEIGHTS}")/tokenizer" ]]; then
+    INITIAL_EVAL_TOKENIZER="$(dirname "${POLICY_INIT_WEIGHTS}")/tokenizer"
+  else
+    INITIAL_EVAL_TOKENIZER="$INITIAL_EVAL_MODEL"
+  fi
+fi
 
 if [[ ! -f "$RAY_SUB" ]]; then
   echo "ERROR: Ray launcher not found: $RAY_SUB"
@@ -69,8 +82,20 @@ cmd=(
   logger.log_dir="$LOG_ROOT/$RUN_NAME"
   logger.wandb.project="$WANDB_PROJECT"
   logger.wandb.name="$WANDB_NAME"
-  "$@"
 )
+
+if [[ -n "${TRAIN_MAX_NEW_TOKENS:-}" ]]; then
+  cmd+=(policy.generation.max_new_tokens="$TRAIN_MAX_NEW_TOKENS")
+fi
+if [[ -n "${TRAIN_TEMPERATURE:-}" ]]; then
+  cmd+=(policy.generation.temperature="$TRAIN_TEMPERATURE")
+fi
+
+if [[ -n "${POLICY_INIT_WEIGHTS:-}" ]]; then
+  cmd+=(policy.initial_weights_path="$POLICY_INIT_WEIGHTS")
+fi
+
+cmd+=("$@")
 
 printf -v COMMAND '%q ' "${cmd[@]}"
 export COMMAND

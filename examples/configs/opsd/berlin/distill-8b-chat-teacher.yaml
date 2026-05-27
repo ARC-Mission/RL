@@ -20,8 +20,8 @@ distillation:
     max_num_steps: 1000
     max_num_epochs: 1
     val_batch_size: 512
-    val_period: 0
-    val_steps: []
+    val_period: 25
+    val_steps: [10, 25]
     val_at_start: false
     val_at_end: false
     max_val_samples: 2560
@@ -222,7 +222,23 @@ data:
     shuffle: true
     train:
         dataset_name: OpenThoughtsMath
-    validation: null
+    validation:
+        - dataset_name: math500
+          repeat: 1
+          prompt_file: "examples/prompts/cot.txt"
+          teacher_prompt_file: null
+        - dataset_name: AIME2024
+          repeat: 4
+          prompt_file: "examples/prompts/cot.txt"
+          teacher_prompt_file: null
+        - dataset_name: AIME2025
+          repeat: 4
+          prompt_file: "examples/prompts/cot.txt"
+          teacher_prompt_file: null
+        - dataset_name: AIME2026
+          repeat: 4
+          prompt_file: "examples/prompts/cot.txt"
+          teacher_prompt_file: null
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null

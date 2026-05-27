@@ -1,18 +1,20 @@
-# Distillation: OLMo3-7B self-distill, v14 teacher prompt, mix50 wu25
-# Cluster: Berlin — 1 node × 4 H100 80GB GPUs
+# Distillation: Qwen3-8B self-distill, reflection-guided teacher, KL-ref wu25
+# Cluster: Berlin, 1 node x 4 H100 GPUs
 #
 # Parallelism (4 GPUs total):
-#   TP=2, CP=1, DP=2
+#   policy TP=2, CP=2 -> DP=1
+#   teacher TP=2, CP=2 -> DP=1
 #   vLLM TP=2
 #
-# Training dynamics (matching Qwen3-8B Jupiter v14-mix50-wu25):
-#   LR = 5e-6, warmup 25 steps (linear → constant)
-#   GBS = 64, topk = 512, reverse KL, 1000 steps
-#   teacher_student_prefix_fraction = 0.50
-#   validation at step 10, step 25, then every 25 steps
-#
-# Teacher prompt: teacher_rewrite_v14_independent_check_improved.txt
-#   {trace} ← mapped from qwen3_8b_answer column
+# Training dynamics identical to d-qwen3-8b-reflect-v1-mix50-wu25-1n4g except:
+#   - Teacher prompt: teacher_reflection_v1_adaptive_effort.txt
+#     {reflection} is mapped from qwen3_8b_reflectionsv1_extracted
+#     (only the <reflection> blocks, not the full reasoning trace).
+#   - No rewrite/two-pass; teacher solves independently using reflections
+#     to calibrate reasoning effort.
+#   - The old 50/50 teacher-prefix mix is disabled; anchoring is handled by an
+#     explicit KL penalty against the frozen unconditioned policy on the same
+#     student rollout tokens.
 
 distillation:
     num_prompts_per_step: 64
@@ -27,7 +29,7 @@ distillation:
     val_at_end: false
     max_val_samples: 2560
     topk_logits_k: 512
-    teacher_student_prefix_fraction: 0.50
+    teacher_student_prefix_fraction: 0.0
     teacher_student_prefix_fraction_start: null
     teacher_student_prefix_fraction_warmup_steps: null
     val_max_total_sequence_length: 33280
@@ -39,10 +41,14 @@ loss_fn:
     kl_type: "reverse"
     mixed_kl_weight: 0.5
     zero_outside_topk: false
+    reference_policy_kl_penalty: 0.05
+    reference_policy_kl_type: "k3"
+    kl_input_clamp_value: 20.0
+    kl_output_clamp_value: 10.0
 
 checkpointing:
     enabled: true
-    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/RL/checkpoints/d-olmo3-7b-v14-mix50-wu25"
+    checkpoint_dir: "/fast/project/HFMI_SynergyUnit/yll/checkpoints/d-qwen3-8b-reflect-v1-klref005-wu25-1n4g-berlin"
     metric_name: null
     higher_is_better: true
     keep_top_k: 3
@@ -52,7 +58,7 @@ checkpointing:
     save_consolidated: false
 
 policy: &POLICY_BASE
-    model_name: "allenai/Olmo-3-7B-Think"
+    model_name: "Qwen/Qwen3-8B"
     tokenizer:
         name: ${..model_name}
         chat_template_kwargs: null
@@ -73,13 +79,13 @@ policy: &POLICY_BASE
         sequence_parallel: false
         activation_checkpointing: true
         tensor_parallel_size: 2
-        context_parallel_size: 1
+        context_parallel_size: 2
         custom_parallel_plan: null
 
     dynamic_batching:
         enabled: true
-        train_mb_tokens: 17408
-        logprob_mb_tokens: 17408
+        train_mb_tokens: 18432
+        logprob_mb_tokens: 32768
         sequence_length_round: 64
 
     sequence_packing:
@@ -105,14 +111,14 @@ policy: &POLICY_BASE
         enabled: false
         empty_unused_memory_level: 0
         activation_checkpointing: false
-        converter_type: "Olmo3ForCausalLM"
+        converter_type: "Qwen3ForCausalLM"
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
-        pipeline_model_parallel_size: 1
+        pipeline_model_parallel_size: 2
         num_layers_in_first_pipeline_stage: null
         num_layers_in_last_pipeline_stage: null
-        context_parallel_size: 1
+        context_parallel_size: 2
         pipeline_dtype: ${policy.precision}
         sequence_parallel: false
         freeze_moe_router: true
@@ -183,7 +189,7 @@ policy: &POLICY_BASE
     generation:
         backend: "vllm"
         max_new_tokens: 16384
-        temperature: 0.6
+        temperature: 1.0
         top_p: 1.0
         top_k: null
         stop_token_ids: null
@@ -195,7 +201,7 @@ policy: &POLICY_BASE
             tensor_parallel_size: 2
             pipeline_parallel_size: 1
             expert_parallel_size: 1
-            gpu_memory_utilization: 0.85
+            gpu_memory_utilization: 0.5
             max_model_len: 33280
             enforce_eager: False
             use_deep_gemm: False
@@ -211,15 +217,15 @@ policy: &POLICY_BASE
 
 teacher:
     <<: *POLICY_BASE
-    model_name: "allenai/Olmo-3-7B-Think"
+    model_name: "Qwen/Qwen3-8B"
     max_total_sequence_length: 33280
     dtensor_cfg:
         <<: *DTENSOR_BASE
         tensor_parallel_size: 2
-        context_parallel_size: 1
+        context_parallel_size: 2
     dynamic_batching:
         enabled: true
-        logprob_mb_tokens: 40960
+        logprob_mb_tokens: 65536
         sequence_length_round: 64
 
 data:
@@ -247,18 +253,18 @@ data:
     default:
         prompt_file: "examples/prompts/cot.txt"
         system_prompt_file: null
-        teacher_prompt_file: "examples/prompts/teacher_rewrite_v14_independent_check_improved.txt"
+        teacher_prompt_file: "examples/prompts/teacher_reflection_v1_adaptive_effort.txt"
         teacher_prefix_prompt_file: null
         env_name: "math"
         column_mapping:
-            qwen3_8b_answer: trace
+            qwen3_8b_reflectionsv1_extracted: reflection
 
 env:
     math:
         num_workers: 8
 
 logger:
-    log_dir: "logs/d-olmo3-7b-v14-mix50-wu25"
+    log_dir: "logs/d-qwen3-8b-reflect-v1-klref005-wu25-1n4g-berlin"
     num_val_samples_to_print: 5
     wandb_enabled: true
     tensorboard_enabled: false
@@ -270,10 +276,10 @@ logger:
         flush_interval: 10
     wandb:
         project: "nemo-distillation"
-        name: "d-olmo3-7b-v14-mix50-wu25"
+        name: "d-qwen3-8b-reflect-v1-klref005-wu25-1n4g-berlin"
     swanlab:
         project: "nemo-distillation"
-        name: "d-olmo3-7b-v14-mix50-wu25"
+        name: "d-qwen3-8b-reflect-v1-klref005-wu25-1n4g-berlin"
 
 cluster:
     gpus_per_node: 4

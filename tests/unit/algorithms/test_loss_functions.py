@@ -1950,17 +1950,81 @@ def test_distillation_loss_fn_initialization():
     assert loss_fn.kl_type == "forward"
     assert loss_fn.mixed_kl_weight == 0.5
     assert not loss_fn.zero_outside_topk
+    assert loss_fn.reference_policy_kl_penalty == 0.0
 
     # Test with custom values
     custom_config = {
         "kl_type": "reverse",
         "mixed_kl_weight": 0.3,
         "zero_outside_topk": True,
+        "reference_policy_kl_penalty": 0.05,
+        "reference_policy_kl_type": "k3",
+        "kl_input_clamp_value": 20.0,
+        "kl_output_clamp_value": 10.0,
     }
     loss_fn = DistillationLossFn(custom_config)
     assert loss_fn.kl_type == "reverse"
     assert loss_fn.mixed_kl_weight == 0.3
     assert loss_fn.zero_outside_topk
+    assert loss_fn.reference_policy_kl_penalty == 0.05
+    assert loss_fn.reference_policy_kl_type == "k3"
+
+
+def test_distillation_loss_reference_policy_kl():
+    """Test optional reference-policy KL regularization in distillation loss."""
+    batch_size = 2
+    seq_len = 4
+    topk = 3
+    torch.manual_seed(0)
+
+    student_topk_logprobs = torch.log_softmax(
+        torch.randn(batch_size, seq_len, topk, requires_grad=True), dim=-1
+    )
+    teacher_topk_logprobs = torch.log_softmax(
+        torch.randn(batch_size, seq_len, topk), dim=-1
+    )
+    student_logprobs = torch.randn(batch_size, seq_len, requires_grad=True)
+    token_mask = torch.ones(batch_size, seq_len + 1)
+    sample_mask = torch.ones(batch_size)
+    data = {
+        "input_ids": torch.ones(batch_size, seq_len + 1, dtype=torch.long),
+        "input_lengths": torch.full((batch_size,), seq_len + 1),
+        "token_mask": token_mask,
+        "sample_mask": sample_mask,
+        "teacher_topk_logits": torch.randn(batch_size, seq_len + 1, topk),
+        "teacher_topk_indices": torch.randint(0, 16, (batch_size, seq_len + 1, topk)),
+        "reference_policy_logprobs": torch.randn(batch_size, seq_len + 1),
+    }
+
+    loss_fn = DistillationLossFn(
+        {
+            "kl_type": "reverse",
+            "mixed_kl_weight": 0.5,
+            "zero_outside_topk": False,
+            "reference_policy_kl_penalty": 0.05,
+            "reference_policy_kl_type": "k3",
+            "kl_input_clamp_value": 20.0,
+            "kl_output_clamp_value": 10.0,
+        }
+    )
+
+    loss, metrics = loss_fn(
+        student_topk_logprobs=student_topk_logprobs,
+        teacher_topk_logprobs=teacher_topk_logprobs,
+        H_all=None,
+        student_logprobs=student_logprobs,
+        data=data,
+        global_valid_seqs=sample_mask.sum(),
+        global_valid_toks=(sample_mask.unsqueeze(-1) * token_mask[:, 1:]).sum(),
+    )
+    loss.backward()
+
+    assert loss.dim() == 0
+    assert metrics["reference_policy/kl_loss"] > 0
+    assert metrics["loss"] == pytest.approx(
+        metrics["distill/loss"] + metrics["reference_policy/kl_loss"]
+    )
+    assert student_logprobs.grad is not None
 
 
 def test_distillation_loss_fn_call():

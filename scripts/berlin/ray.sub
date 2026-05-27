@@ -61,6 +61,8 @@ GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 CPUS_PER_WORKER="${CPUS_PER_WORKER:-${SLURM_CPUS_PER_TASK:-16}}"
 RAY_PORT="${RAY_PORT:-$((6379 + SLURM_JOB_ID % 1000))}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-$((8265 + SLURM_JOB_ID % 1000))}"
+RAY_STOP_EXISTING="${RAY_STOP_EXISTING:-1}"
+RAY_STOP_ON_EXIT="${RAY_STOP_ON_EXIT:-$RAY_STOP_EXISTING}"
 
 module purge
 module load GCC/13.3.0
@@ -137,9 +139,11 @@ cleanup() {
   for pid in "${SRUN_PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
-  for node in "${nodes[@]:-}"; do
-    srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
-  done
+  if [[ "$RAY_STOP_ON_EXIT" == "1" ]]; then
+    for node in "${nodes[@]:-}"; do
+      srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+    done
+  fi
   return "$rc"
 }
 trap cleanup EXIT
@@ -148,15 +152,23 @@ trap 'TERMINATION_SIGNAL="SIGTERM"; exit 143' TERM
 
 get_node_ip() {
   local node="$1"
+  local ip=""
   if [[ -n "${NETWORK_IFACE:-}" ]]; then
-    srun --overlap -N1 -n1 -w "$node" \
+    ip="$(srun --overlap -N1 -n1 -w "$node" \
       bash -lc "ip -4 -o addr show dev '$NETWORK_IFACE' | awk '{split(\$4, a, \"/\"); print a[1]; exit}'" \
-      2>/dev/null || true
+      2>/dev/null || true)"
   else
-    srun --overlap -N1 -n1 -w "$node" \
+    ip="$(srun --overlap -N1 -n1 -w "$node" \
       bash -lc "hostname -I | awk '{print \$1}'" \
-      2>/dev/null || true
+      2>/dev/null || true)"
   fi
+  if [[ -z "$ip" ]]; then
+    ip="$(getent ahostsv4 "$node" | awk '{print $1; exit}' 2>/dev/null || true)"
+  fi
+  if [[ -z "$ip" ]]; then
+    ip="$(getent hosts "$node" | awk '{print $1; exit}' 2>/dev/null || true)"
+  fi
+  printf '%s\n' "$ip"
 }
 
 if [[ -n "${NETWORK_IFACE:-}" ]]; then
@@ -180,9 +192,11 @@ for node in "${nodes[@]}"; do
   echo "[INFO] $node -> $ip"
 done
 
-for node in "${nodes[@]}"; do
-  srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
-done
+if [[ "$RAY_STOP_EXISTING" == "1" ]]; then
+  for node in "${nodes[@]}"; do
+    srun --overlap -N1 -n1 -w "$node" "$RAY_BIN" stop --force >/dev/null 2>&1 || true
+  done
+fi
 
 head_ip="${NODE_IPS[$head_node]}"
 head_addr="${head_ip}:$RAY_PORT"
@@ -276,6 +290,7 @@ if [[ -n "$COMMAND" ]]; then
   echo "[INFO] Running: $COMMAND"
   set +e
   cd "$REPO_ROOT"
+  export RAY_ADDRESS="$head_addr"
   eval "$COMMAND" > "$LOG_DIR/ray-driver.log" 2>&1
   DRIVER_RC=$?
   set -e

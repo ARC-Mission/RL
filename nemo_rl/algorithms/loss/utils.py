@@ -122,7 +122,21 @@ def prepare_loss_input(
             "student_topk_logprobs": student_topk_logprobs,
             "teacher_topk_logprobs": teacher_topk_logprobs,
             "H_all": H_all,
+            "student_logprobs": None,
         }
+        if (
+            hasattr(loss_fn, "reference_policy_kl_penalty")
+            and loss_fn.reference_policy_kl_penalty != 0
+        ):
+            loss_input["student_logprobs"] = get_next_token_logprobs_from_logits(
+                input_ids=data["input_ids"],
+                next_token_logits=logits,
+                seq_index=data.get("seq_index", None),
+                vocab_parallel_rank=vocab_parallel_rank,
+                vocab_parallel_group=vocab_parallel_group,
+                context_parallel_group=context_parallel_group,
+                sampling_params=None,
+            )
 
     else:
         raise ValueError(f"Unknown loss function input type: {loss_fn.input_type}")

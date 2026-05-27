@@ -34,6 +34,28 @@ training_job_is_active() {
   [[ -n "$(squeue -h -j "$TRAINING_JOB_ID" 2>/dev/null)" ]]
 }
 
+submitted_eval_failed() {
+  local marker="$1"
+  local job_id
+  job_id="$(awk -F= '/^job_id=/ {print $2; exit}' "$marker" 2>/dev/null || true)"
+  if [[ -z "$job_id" ]]; then
+    return 1
+  fi
+
+  local state
+  state="$(
+    sacct -n -X -j "$job_id" --format=State --parsable2 2>/dev/null \
+      | awk -F'|' 'NF {print $1; exit}'
+  )"
+  case "$state" in
+    FAILED|CANCELLED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|PREEMPTED|BOOT_FAIL|DEADLINE)
+      echo "Eval job $job_id from $marker is $state; clearing marker for retry."
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 if [[ -n "$TRAINING_JOB_ID" ]]; then
   echo "Watching checkpoints while Slurm job $TRAINING_JOB_ID is active."
 fi
@@ -50,16 +72,33 @@ while true; do
     hf_model="$ckpt/policy/weights/model/consolidated"
     config_file="$ckpt/config.yaml"
 
-    if [[ -f "$marker" || -f "$done_marker" ]]; then
+    if [[ -f "$done_marker" ]]; then
       continue
+    fi
+    if [[ -f "$marker" ]]; then
+      if submitted_eval_failed "$marker"; then
+        rm -f "$marker"
+      else
+        continue
+      fi
     fi
     if [[ ! -f "$config_file" || ! -d "$hf_model" ]]; then
       continue
     fi
 
     mkdir -p "$ckpt/evals"
-    "$SCRIPT_DIR/run_sft_checkpoint_eval.sh" "$ckpt" "$@"
-    date -Is > "$marker"
+    submit_output="$(
+      RUN_NAME="eval-$(basename "$CKPT_ROOT")-$(basename "$ckpt")" \
+        "$SCRIPT_DIR/run_sft_checkpoint_eval.sh" "$ckpt" "$@"
+    )"
+    printf '%s\n' "$submit_output"
+    job_id="$(awk '/Submitted batch job/ {print $4; exit}' <<<"$submit_output")"
+    {
+      date -Is
+      if [[ -n "$job_id" ]]; then
+        echo "job_id=$job_id"
+      fi
+    } > "$marker"
     submitted_any=1
   done
   shopt -u nullglob
